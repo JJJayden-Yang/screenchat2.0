@@ -13,9 +13,11 @@ import base64
 import io
 import json
 import os
+import queue
 import re
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -72,18 +74,20 @@ class ScreenChat:
     ③ 打印结果   — should_comment=true 就打印评论，false 就打个点
     """
 
-    def __init__(self, config):
+    def __init__(self, config, comment_queue=None):
         self.config = config
-        # MSS 是跨平台截图库，性能比 PIL ImageGrab 好得多
+        self.comment_queue = comment_queue
         self.sct = mss.MSS()
-        # OpenAI SDK 配上 Moonshot 的 base_url，代码不变、模型换成 Kimi
         self.client = OpenAI(
             base_url=config["base_url"],
             api_key=config["api_key"],
         )
         self.running = True
-        # 注册 Ctrl+C 信号处理器，确保退出时打印告别语
-        signal.signal(signal.SIGINT, self._on_sigint)
+        # signal 只能在主线程注册，子线程跳过
+        try:
+            signal.signal(signal.SIGINT, self._on_sigint)
+        except ValueError:
+            pass
 
     def _on_sigint(self, signum, frame):
         """Ctrl+C 时优雅退出。"""
@@ -172,7 +176,10 @@ class ScreenChat:
                     max_tokens=2000,  # Kimi reasoning 吃 token，给够空间让 JSON 完整输出
                 )
                 msg = resp.choices[0].message
-                # 优先用 content；若 AI 仍走了 reasoning 导致 content 空，则兜底
+                # 测试阶段：打印 reasoning 过程到终端方便 debug
+                reasoning = getattr(msg, "reasoning_content", "") or ""
+                if reasoning:
+                    print(f"  [debug] {reasoning[:300]}...")
                 raw = (msg.content or "").strip()
                 if raw:
                     return raw
@@ -219,9 +226,11 @@ class ScreenChat:
                 result = json.loads(raw)
                 ts = datetime.now().strftime("%H:%M:%S")
                 if result.get("should_comment"):
-                    print(f"[{ts}] 💬 {result['comment']}")
+                    comment = result["comment"]
+                    print(f"[{ts}] 💬 {comment}")
+                    if self.comment_queue is not None:
+                        self.comment_queue.put(comment)
                 else:
-                    # · 表示本轮有在跑，但 AI 觉得不需要说话
                     print(f"[{ts}] ·")
 
             except json.JSONDecodeError:
@@ -255,8 +264,25 @@ def main():
         print("请先在 .env 里设置 SCREENCHAT_OPENAI_API_KEY")
         sys.exit(1)
 
-    app = ScreenChat(config)
-    app.run()
+    comment_queue = queue.Queue()
+
+    # 截图循环跑在守护线程，AI 评论通过 comment_queue 发出
+    def _run_loop():
+        app = ScreenChat(config, comment_queue=comment_queue)
+        app.run()
+
+    t = threading.Thread(target=_run_loop, daemon=True)
+    t.start()
+
+    # 确保 src/ 在 Python path 中
+    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
+
+    # 主线程给 rumps 菜单栏图标
+    from screenchat.tray import icon as tray_icon
+    tray_app = tray_icon.ScreenChatTray(comment_queue)
+    tray_app.run()
 
 
 if __name__ == "__main__":
