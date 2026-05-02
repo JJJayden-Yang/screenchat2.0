@@ -19,7 +19,10 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
+
+import imagehash
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -37,6 +40,7 @@ def load_config():
         "model": os.getenv("SCREENCHAT_AGENT_MODEL", "kimi-k2.5"),
         "base_url": os.getenv("SCREENCHAT_OPENAI_BASE_URL", "https://api.moonshot.ai/v1"),
         "interval": int(os.getenv("SCREENCHAT_CAPTURE_INTERVAL", "20")),
+        "memory_maxlen": int(os.getenv("SCREENCHAT_MEMORY_MAXLEN", "20")),
     }
 
 
@@ -83,7 +87,8 @@ class ScreenChat:
             api_key=config["api_key"],
         )
         self.running = True
-        # signal 只能在主线程注册，子线程跳过
+        self.message_history = deque(maxlen=config["memory_maxlen"])  # 可配的消息序列
+        self._last_dhash = None  # Layer 3: 感知哈希去重
         try:
             signal.signal(signal.SIGINT, self._on_sigint)
         except ValueError:
@@ -122,21 +127,17 @@ class ScreenChat:
         # JPEG 压缩到内存 buffer，再 base64 编码
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
+        return base64.b64encode(buf.getvalue()).decode("utf-8"), img
 
     # ── 步骤 ②：AI 分析 ───────────────────────────────
 
     def analyze(self, image_b64):
         """
-        把 base64 图片发给 Kimi K2.5，让 AI 看画面 + 决定是否说话。
+        把 base64 图片发给 Kimi K2.5，带上消息历史。
 
-        返回值是纯 JSON 字符串，格式：
-        {"should_comment": bool, "comment": "评论内容", "category": "场景分类"}
-
-        如果服务端过载（429），自动退避重试，最多 3 次。
-        全部重试失败就返回默认 JSON（不说话）。
+        返回值是纯 JSON 字符串：
+        {"should_comment": bool, "comment": "...", "category": "..."}
         """
-        # 系统 prompt 定义「小幕」的朋友型人格
         prompt = (
             "你是「小幕」，一个桌面 AI 陪伴伙伴。\n"
             "你的个性：像大学室友，会吐槽、会夸你、会提醒你别上头。\n"
@@ -146,58 +147,93 @@ class ScreenChat:
             "- 大部分时候闭嘴。只有真的注意到有趣/有用/不对劲的事才说话。\n"
             "- 如果画面很日常（桌面、浏览器首页、文件管理器）→ 不用说话。\n"
             "- 如果用户正在专注做事（打游戏团战、写代码中）→ 尽量不打扰。\n"
+            "- 别说和之前重复的话。\n"
             "- 只说 1-2 句，简洁自然。\n\n"
             "只回复 JSON，不要有任何额外内容：\n"
             '{"should_comment": true或false, "comment": "如果说话，1-2句自然口语。如果不说，空字符串", '
             '"category": "gaming|coding|trading|studying|writing|social|shopping|language|interview|design|health|general"}'
         )
 
-        # 最多重试 3 次，应对 Moonshot 服务端偶发过载
+        # 构建消息序列：system + 历史文本 + 当前图片
+        messages = [{"role": "system", "content": prompt}]
+        messages.extend(list(self.message_history))
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{image_b64}",
+                        "detail": "high",
+                    },
+                }
+            ],
+        })
+
         for attempt in range(3):
             try:
                 resp = self.client.chat.completions.create(
                     model=self.config["model"],
-                    messages=[
-                        {"role": "system", "content": prompt},
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{image_b64}",
-                                        "detail": "high",
-                                    },
-                                }
-                            ],
-                        },
-                    ],
+                    messages=messages,
                     temperature=1,
-                    max_tokens=2000,  # Kimi reasoning 吃 token，给够空间让 JSON 完整输出
+                    max_tokens=2000,
                 )
                 msg = resp.choices[0].message
-                # 测试阶段：打印 reasoning 过程到终端方便 debug
                 reasoning = getattr(msg, "reasoning_content", "") or ""
                 if reasoning:
                     print(f"  [debug] {reasoning[:300]}...")
                 raw = (msg.content or "").strip()
                 if raw:
                     return raw
-                # content 空 → silent
                 return '{"should_comment": false, "comment": "", "category": "general"}'
 
             except Exception as e:
                 err = str(e)
-                # 429 = 服务端过载，等一会儿重试
                 if "429" in err or "overloaded" in err:
-                    wait = 2 ** attempt  # 指数退避：1s → 2s → 4s
+                    wait = 2 ** attempt
                     print(f"  (服务繁忙，{wait}s 后重试...)")
                     time.sleep(wait)
                     continue
                 raise
 
-        # 全部重试都失败了，就当没什么可说的
         return '{"should_comment": false, "comment": "", "category": "general"}'
+
+    # ── Layer 2：场景摘要压缩 ─────────────────────────
+
+    def _compress_history(self):
+        """当消息历史接近满载时，将最早 3 轮压缩为一句摘要。"""
+        maxlen = self.message_history.maxlen
+        if len(self.message_history) < maxlen - 4:
+            return  # 还没满，不压
+
+        # 取最早 3 轮（6条）做素材，保留最近 2 轮不动
+        old = list(self.message_history)[:6]
+        recent = list(self.message_history)[6:]
+
+        # 提取 AI 说过的话
+        said = [o["content"] for o in old if o["role"] == "assistant"]
+        prompt = (
+            "把以下 AI 陪伴助手对用户说过的话压缩为一句 20-30 字的简洁摘要。\n"
+            "只写摘要本身，不要多余内容。\n\n"
+            + "\n".join(f"- {s}" for s in said)
+        )
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.config["model"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=60,
+            )
+            summary = resp.choices[0].message.content.strip()
+        except Exception:
+            summary = "刚才聊了几句。"
+
+        # 重建：压缩摘要 + 最近轮次
+        self.message_history.clear()
+        self.message_history.append({"role": "user", "content": "(稍早前)"})
+        self.message_history.append({"role": "assistant", "content": summary})
+        for item in recent:
+            self.message_history.append(item)
 
     # ── 步骤 ③：主循环 ─────────────────────────────────
 
@@ -219,17 +255,37 @@ class ScreenChat:
                 t0 = time.time()
 
                 # ① 截图
-                b64 = self.capture()
-                # ② AI 分析
+                b64, img = self.capture()
+
+                # ② Layer 3: 感知哈希去重
+                dhash = imagehash.dhash(img)
+                if self._last_dhash is not None and (self._last_dhash - dhash) < 5:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] · (dup)")
+                    elapsed = time.time() - t0
+                    sleep_time = max(0, self.config["interval"] - elapsed)
+                    if self.running:
+                        time.sleep(sleep_time)
+                    continue
+                self._last_dhash = dhash
+
+                # ③ AI 分析
                 raw = self.analyze(b64)
-                # ③ 解析 AI 返回的 JSON，决定是否打印
                 result = json.loads(raw)
                 ts = datetime.now().strftime("%H:%M:%S")
                 if result.get("should_comment"):
                     comment = result["comment"]
                     print(f"[{ts}] 💬 {comment}")
+                    # Layer 1: 追加到消息历史
+                    self.message_history.append(
+                        {"role": "user", "content": f"(约{self.config['interval']}秒前)"}
+                    )
+                    self.message_history.append(
+                        {"role": "assistant", "content": comment}
+                    )
                     if self.comment_queue is not None:
                         self.comment_queue.put(comment)
+                    # Layer 2: 消息快满时压缩旧轮
+                    self._compress_history()
                 else:
                     print(f"[{ts}] ·")
 
