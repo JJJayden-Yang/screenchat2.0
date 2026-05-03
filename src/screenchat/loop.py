@@ -24,15 +24,9 @@ import mss
 # ── 配置 ──────────────────────────────────────────────────
 
 def load_config():
-    """从 .env 文件读取配置，返回 dict。不做复杂抽象——够用就好。"""
-    load_dotenv()
-    return {
-        "api_key": os.getenv("SCREENCHAT_OPENAI_API_KEY", ""),
-        "model": os.getenv("SCREENCHAT_AGENT_MODEL", "kimi-k2.5"),
-        "base_url": os.getenv("SCREENCHAT_OPENAI_BASE_URL", "https://api.moonshot.ai/v1"),
-        "interval": int(os.getenv("SCREENCHAT_CAPTURE_INTERVAL", "20")),
-        "memory_maxlen": int(os.getenv("SCREENCHAT_MEMORY_MAXLEN", "20")),
-    }
+    """统一配置入口：settings.json > .env > defaults。"""
+    from screenchat.config import load as cfg_load
+    return cfg_load()
 
 
 def _extract_json(raw):
@@ -69,9 +63,10 @@ class ScreenChat:
     ③ 打印结果   — should_comment=true 就打印评论，false 就打个点
     """
 
-    def __init__(self, config, comment_queue=None):
+    def __init__(self, config, comment_queue=None, shared_state=None):
         self.config = config
         self.comment_queue = comment_queue
+        self.shared = shared_state or {}  # 跨线程共享状态（mute 等）
         self.sct = mss.MSS()
         self.client = OpenAI(
             base_url=config["base_url"],
@@ -255,7 +250,7 @@ class ScreenChat:
 
         如果 AI 决定说话就打印评论，不说就打印一个 · 表示本轮在安静运行。
         """
-        print(f"[小幕] 启动了~ 每 {self.config['interval']} 秒看一眼屏幕")
+        print(f"[小幕] 启动了~ 每 {self.config['capture_interval']} 秒看一眼屏幕")
         print("[小幕] 按 Ctrl+C 退出\n")
 
         while self.running:
@@ -270,13 +265,22 @@ class ScreenChat:
                 if self._last_dhash is not None and (self._last_dhash - dhash) < 5:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] · (dup)")
                     elapsed = time.time() - t0
-                    sleep_time = max(0, self.config["interval"] - elapsed)
+                    sleep_time = max(0, self.config["capture_interval"] - elapsed)
                     if self.running:
                         time.sleep(sleep_time)
                     continue
                 self._last_dhash = dhash
 
-                # ③ AI 分析
+                # ③ 静音检查
+                if self.shared.value:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] · (muted)")
+                    elapsed = time.time() - t0
+                    sleep_time = max(0, self.config["capture_interval"] - elapsed)
+                    if self.running:
+                        time.sleep(sleep_time)
+                    continue
+
+                # ④ AI 分析
                 raw = self.analyze(b64)
                 result = json.loads(raw)
                 ts = datetime.now().strftime("%H:%M:%S")
@@ -285,15 +289,14 @@ class ScreenChat:
                     category = result.get("category", "general")
                     screen_summary = result.get("screen_summary") or ""
                     print(f"[{ts}] 💬 {comment}")
-                    # Layer 1: 追加到消息历史，user 用截图概括
-                    user_ctx = f"刚才：{screen_summary}" if screen_summary else f"(约{self.config['interval']}秒前)"
+                    # Layer 1: 追加到消息历史
+                    user_ctx = f"刚才：{screen_summary}" if screen_summary else f"(约{self.config['capture_interval']}秒前)"
                     self.message_history.append(
                         {"role": "user", "content": user_ctx}
                     )
                     self.message_history.append(
                         {"role": "assistant", "content": comment}
                     )
-                    # 持久化到 SQLite
                     try:
                         from screenchat.memory import database as memdb
                         memdb.insert(screen_summary, comment, category)
@@ -324,7 +327,7 @@ class ScreenChat:
             # 精确计时：用 sleep 时间补 AI 调用 + 截图耗时
             # 如果 AI 调用了 5 秒，就只 sleep 15 秒，保证总周期约 20 秒
             elapsed = time.time() - t0
-            sleep_time = max(0, self.config["interval"] - elapsed)
+            sleep_time = max(0, self.config["capture_interval"] - elapsed)
             if self.running:
                 time.sleep(sleep_time)
 
@@ -332,34 +335,61 @@ class ScreenChat:
 # ── 入口 ──────────────────────────────────────────────────
 
 def main():
-    config = load_config()
-    if not config["api_key"] or "your-api-key" in config["api_key"]:
-        print("请先在 .env 里设置 SCREENCHAT_OPENAI_API_KEY")
-        sys.exit(1)
-
-    # 确保 src/ 在 Python path 中
     _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _src not in sys.path:
         sys.path.insert(0, _src)
 
-    # 初始化数据库（建表）
+    config = load_config()
+    if not config["api_key"] or "your-api-key" in config["api_key"]:
+        print("请先在 .env 或设置中配置 API Key")
+        sys.exit(1)
+
     from screenchat.memory import database as memdb
     memdb.init()
 
-    comment_queue = queue.Queue()
+    import multiprocessing
+    mp_comment = multiprocessing.Queue()
+    mp_ui = multiprocessing.Queue()
+    mp_muted = multiprocessing.Value('b', config.get("muted", False))
 
-    # 截图循环跑在守护线程，AI 评论通过 comment_queue 发出
+    # 在子线程里 mute 直接读 mp_muted.value
+    shared = mp_muted
+
     def _run_loop():
-        app = ScreenChat(config, comment_queue=comment_queue)
+        app = ScreenChat(config, comment_queue=mp_comment, shared_state=shared)
         app.run()
 
     t = threading.Thread(target=_run_loop, daemon=True)
     t.start()
 
-    # 主线程给 rumps 菜单栏图标
-    from screenchat.tray import icon as tray_icon
-    tray_app = tray_icon.ScreenChatTray(comment_queue)
-    tray_app.run()
+    # rumps 进子进程，customtkinter 占主线程
+    from screenchat.tray.icon import run_tray
+    tray_proc = multiprocessing.Process(
+        target=run_tray,
+        args=(mp_comment, mp_ui, mp_muted, _src),
+        daemon=True,
+    )
+    tray_proc.start()
+
+    import customtkinter as ctk
+    root = ctk.CTk()
+    root.withdraw()
+
+    def _check_ui():
+        try:
+            action = mp_ui.get_nowait()
+            if action == "history":
+                from screenchat.ui.history_window import open_history
+                open_history()
+            elif action == "settings":
+                from screenchat.ui.settings_window import open_settings
+                open_settings()
+        except Exception:
+            pass
+        root.after(500, _check_ui)
+
+    root.after(200, _check_ui)
+    root.mainloop()
 
 
 if __name__ == "__main__":
