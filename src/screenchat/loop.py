@@ -1,13 +1,4 @@
-"""
-ScreenChat 的核心主循环。
 
-和 Claude Code 的主循环同构：
-  Claude Code: while True → 等用户输入 → 发 LLM → 输出结果
-  ScreenChat:  while True → 等 N 秒 → 截图 → 发视觉 LLM → AI 决定是否说话
-
-整个系统只有这一个文件在跑，没有 GUI、没有托盘、没有历史——只有终端输出。
-后续所有功能（去重、托盘、聊天窗口、快捷键）都从这个循环上生长出来。
-"""
 
 import base64
 import io
@@ -87,11 +78,27 @@ class ScreenChat:
             api_key=config["api_key"],
         )
         self.running = True
-        self.message_history = deque(maxlen=config["memory_maxlen"])  # 可配的消息序列
+        self.message_history = deque(maxlen=config["memory_maxlen"])
+        self._load_today_history()  # 启动时恢复今天的对话记忆
         self._last_dhash = None  # Layer 3: 感知哈希去重
         try:
             signal.signal(signal.SIGINT, self._on_sigint)
         except ValueError:
+            pass
+
+    def _load_today_history(self):
+        """启动时从 SQLite 加载今天的历史对话到 message_history。"""
+        try:
+            from screenchat.memory import database as memdb
+            records = memdb.get_today()
+            # 只加载最近的 N 条，不超过 maxlen
+            for r in records[-(self.message_history.maxlen // 2):]:
+                user_ctx = f"更早：{r.screen_summary}" if r.screen_summary else "(更早)"
+                self.message_history.append({"role": "user", "content": user_ctx})
+                self.message_history.append({"role": "assistant", "content": r.comment})
+            if self.message_history:
+                print(f"  (已加载今天 {len(records)} 条历史对话)")
+        except Exception:
             pass
 
     def _on_sigint(self, signum, frame):
@@ -151,7 +158,8 @@ class ScreenChat:
             "- 只说 1-2 句，简洁自然。\n\n"
             "只回复 JSON，不要有任何额外内容：\n"
             '{"should_comment": true或false, "comment": "如果说话，1-2句自然口语。如果不说，空字符串", '
-            '"category": "gaming|coding|trading|studying|writing|social|shopping|language|interview|design|health|general"}'
+            '"category": "gaming|coding|trading|studying|writing|social|shopping|language|interview|design|health|general", '
+            '"screen_summary": "可选，20字内概括当前截图内容，方便后续记忆"}'
         )
 
         # 构建消息序列：system + 历史文本 + 当前图片
@@ -274,14 +282,23 @@ class ScreenChat:
                 ts = datetime.now().strftime("%H:%M:%S")
                 if result.get("should_comment"):
                     comment = result["comment"]
+                    category = result.get("category", "general")
+                    screen_summary = result.get("screen_summary") or ""
                     print(f"[{ts}] 💬 {comment}")
-                    # Layer 1: 追加到消息历史
+                    # Layer 1: 追加到消息历史，user 用截图概括
+                    user_ctx = f"刚才：{screen_summary}" if screen_summary else f"(约{self.config['interval']}秒前)"
                     self.message_history.append(
-                        {"role": "user", "content": f"(约{self.config['interval']}秒前)"}
+                        {"role": "user", "content": user_ctx}
                     )
                     self.message_history.append(
                         {"role": "assistant", "content": comment}
                     )
+                    # 持久化到 SQLite
+                    try:
+                        from screenchat.memory import database as memdb
+                        memdb.insert(screen_summary, comment, category)
+                    except Exception:
+                        pass
                     if self.comment_queue is not None:
                         self.comment_queue.put(comment)
                     # Layer 2: 消息快满时压缩旧轮
@@ -320,6 +337,15 @@ def main():
         print("请先在 .env 里设置 SCREENCHAT_OPENAI_API_KEY")
         sys.exit(1)
 
+    # 确保 src/ 在 Python path 中
+    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
+
+    # 初始化数据库（建表）
+    from screenchat.memory import database as memdb
+    memdb.init()
+
     comment_queue = queue.Queue()
 
     # 截图循环跑在守护线程，AI 评论通过 comment_queue 发出
@@ -329,11 +355,6 @@ def main():
 
     t = threading.Thread(target=_run_loop, daemon=True)
     t.start()
-
-    # 确保 src/ 在 Python path 中
-    _src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if _src not in sys.path:
-        sys.path.insert(0, _src)
 
     # 主线程给 rumps 菜单栏图标
     from screenchat.tray import icon as tray_icon
