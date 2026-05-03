@@ -4,22 +4,34 @@
 
 **macOS 优先**，Windows / Linux 后续适配。
 
-## 怎么跑
+## 快速开始
 
 ```bash
-# 1. 安装依赖
+# 0. 确保 Python >= 3.11
+python3 --version
+
+# 1. 克隆 + 进目录
+git clone https://github.com/JJJayden-Yang/screenchat2.0.git
+cd screenchat2.0
+
+# 2. 创建虚拟环境（可选但推荐）
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 3. 一键装所有依赖（mss、Pillow、openai、rumps、customtkinter 等）
 pip install -e .
 
-# 2. 配置 API Key（二选一）
-
-## 方式 A：环境变量
+# 4. 配 API Key → 去 https://platform.moonshot.ai 申请
+#    方式 A：写环境变量
 export SCREENCHAT_OPENAI_API_KEY=sk-你的key
 
-## 方式 B：在应用里填（启动后点菜单栏图标 → 偏好设置）
+#    方式 B：启动后在菜单栏「小幕」→ 偏好设置里填
 
-# 3. 启动
+# 5. 跑
 python src/screenchat/loop.py
 ```
+
+菜单栏出现「小幕」图标，看到 `启动了~` 就成功了。
 
 ## 做了什么
 
