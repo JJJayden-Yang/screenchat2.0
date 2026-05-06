@@ -13,7 +13,8 @@ def open_settings():
 
     # ── API Key ──
     ctk.CTkLabel(win, text="API Key").pack(anchor="w", padx=20, pady=(16, 2))
-    key_var = ctk.StringVar(value=_mask_key(config["api_key"]))
+    _orig_key = config["api_key"]
+    key_var = ctk.StringVar(value=_orig_key)
     key_entry = ctk.CTkEntry(win, textvariable=key_var, show="*", width=360)
     key_entry.pack(padx=20)
 
@@ -28,7 +29,9 @@ def open_settings():
     ctk.CTkEntry(win, textvariable=mem_var, width=360).pack(padx=20)
 
     def on_save():
-        save("api_key", key_var.get())
+        new_key = key_var.get()
+        if new_key and new_key != _orig_key:
+            save("api_key", new_key)
         save("capture_interval", int(interval_var.get() or "20"))
         save("memory_maxlen", int(mem_var.get() or "20"))
         win.destroy()
@@ -44,11 +47,3 @@ def open_settings():
 
     # 让窗口获得焦点
     win.after(100, win.focus)
-
-
-def _mask_key(key: str) -> str:
-    if not key or key == "your-api-key":
-        return ""
-    if len(key) <= 8:
-        return key[:3] + "*" * (len(key) - 3)
-    return key[:5] + "*" * (len(key) - 5)

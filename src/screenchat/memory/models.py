@@ -8,3 +8,4 @@ class Conversation:
     comment: str
     category: str
     created_at: str
+    role: str = "assistant"

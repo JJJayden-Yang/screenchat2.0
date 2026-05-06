@@ -63,19 +63,20 @@ class ScreenChat:
     ③ 打印结果   — should_comment=true 就打印评论，false 就打个点
     """
 
-    def __init__(self, config, comment_queue=None, shared_state=None):
+    def __init__(self, config, comment_queue=None, shared_state=None, message_history=None):
         self.config = config
         self.comment_queue = comment_queue
-        self.shared = shared_state or {}  # 跨线程共享状态（mute 等）
+        self.shared = shared_state or {}
         self.sct = mss.MSS()
         self.client = OpenAI(
             base_url=config["base_url"],
             api_key=config["api_key"],
         )
         self.running = True
-        self.message_history = deque(maxlen=config["memory_maxlen"])
-        self._load_today_history()  # 启动时恢复今天的对话记忆
-        self._last_dhash = None  # Layer 3: 感知哈希去重
+        self.message_history = message_history or deque(maxlen=config["memory_maxlen"])
+        if not message_history:
+            self._load_today_history()
+        self._last_dhash = None
         try:
             signal.signal(signal.SIGINT, self._on_sigint)
         except ValueError:
@@ -354,9 +355,20 @@ def main():
 
     # 在子线程里 mute 直接读 mp_muted.value
     shared = mp_muted
+    message_history = deque(maxlen=config["memory_maxlen"])
+    # 加载今天历史
+    try:
+        records = memdb.get_today()
+        for r in records[-(config["memory_maxlen"] // 2):]:
+            ctx = f"更早：{r.screen_summary}" if r.screen_summary else "(更早)"
+            message_history.append({"role": "user", "content": ctx})
+            message_history.append({"role": "assistant", "content": r.comment})
+    except Exception:
+        pass
 
     def _run_loop():
-        app = ScreenChat(config, comment_queue=mp_comment, shared_state=shared)
+        app = ScreenChat(config, comment_queue=mp_comment,
+                         shared_state=shared, message_history=message_history)
         app.run()
 
     t = threading.Thread(target=_run_loop, daemon=True)
@@ -371,6 +383,60 @@ def main():
     )
     tray_proc.start()
 
+    # 共享客户端（给聊天窗口用）
+    shared_client = OpenAI(
+        base_url=config["base_url"],
+        api_key=config["api_key"],
+    )
+    shared_sct = mss.MSS()
+
+    def _capture_for_chat():
+        """聊天窗口用的截图函数。"""
+        monitor = shared_sct.monitors[1]
+        raw = shared_sct.grab(monitor)
+        img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+        w, h = img.size
+        if max(w, h) > 1280:
+            ratio = 1280 / max(w, h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    def _send_chat(text: str, attach_screenshot: bool = False) -> str:
+        """聊天回调：用户文本 → Kimi 回复。默认不带截图省钱。"""
+        messages_for_ai = [
+            {"role": "system", "content": (
+                "你是「小幕」，一个桌面 AI 陪伴伙伴。"
+                "你的个性：像大学室友，会吐槽、会夸你、会提醒你别上头。"
+                "说话自然口语化，像微信聊天。"
+            )},
+        ]
+        for item in list(message_history):
+            messages_for_ai.append(
+                {"role": item["role"], "content": item["content"]})
+        # 用户消息
+        user_content = []
+        user_content.append({"type": "text", "text": text})
+        if attach_screenshot:
+            b64 = _capture_for_chat()
+            user_content.append(
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{b64}", "detail": "high"}})
+        messages_for_ai.append({"role": "user", "content": user_content})
+        resp = shared_client.chat.completions.create(
+            model=config["model"], messages=messages_for_ai,
+            temperature=1, max_tokens=2000,
+        )
+        reply = resp.choices[0].message.content.strip()
+        # Persist
+        try:
+            memdb.insert("", text, "general", role="user")
+            memdb.insert("", reply, "general", role="assistant")
+        except Exception:
+            pass
+        return reply
+
     import customtkinter as ctk
     root = ctk.CTk()
     root.withdraw()
@@ -378,9 +444,9 @@ def main():
     def _check_ui():
         try:
             action = mp_ui.get_nowait()
-            if action == "history":
-                from screenchat.ui.history_window import open_history
-                open_history()
+            if action == "chat":
+                from screenchat.ui.chat_window import open_chat
+                open_chat(lambda t, f=False: _send_chat(t, f))
             elif action == "settings":
                 from screenchat.ui.settings_window import open_settings
                 open_settings()

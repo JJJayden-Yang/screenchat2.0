@@ -31,7 +31,7 @@ class ScreenChatTray(rumps.App):
         mute_item = rumps.MenuItem(label, callback=self._on_toggle_mute)
         self.menu = [
             mute_item,
-            rumps.MenuItem("最近记录...", callback=self._on_history),
+            rumps.MenuItem("对话...", callback=self._on_chat),
             rumps.MenuItem("偏好设置...", callback=self._on_settings),
             None,
             rumps.MenuItem("退出", callback=lambda _: rumps.quit_application()),
@@ -50,9 +50,9 @@ class ScreenChatTray(rumps.App):
         except Exception:
             pass
 
-    def _on_history(self, _sender):
+    def _on_chat(self, _sender):
         if self.ui_queue:
-            self.ui_queue.put("history")
+            self.ui_queue.put("chat")
 
     def _on_settings(self, _sender):
         if self.ui_queue:
