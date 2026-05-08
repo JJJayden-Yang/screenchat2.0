@@ -31,7 +31,8 @@ def open_chat(send_callback):
     if records:
         for r in records:
             ts = r.created_at[11:16] if "T" in r.created_at else ""
-            _bubble(msg_frame, r.comment, r.role, ts, r.screen_summary)
+            extra = _record_extra(r)
+            _bubble(msg_frame, r.comment, r.role, ts, extra)
     else:
         ctk.CTkLabel(msg_frame, text="今天还没有对话，开始聊聊吧",
                      font=ctk.CTkFont(size=13), text_color=META_COLOR).pack(pady=40)
@@ -138,3 +139,22 @@ def _bubble(frame, text, role, timestamp="", extra=""):
         wraplength=340, justify="left",
         text_color=TEXT_COLOR,
     ).pack(anchor="w")
+
+
+def _record_extra(record):
+    """把陪跑事件转换成聊天气泡上方的简短说明。"""
+    if getattr(record, "event_type", "message") == "message":
+        return record.screen_summary
+    labels = {
+        "start": "开始陪跑",
+        "reminder": "陪跑提醒",
+        "manual_end": "陪跑总结",
+        "auto_end": "陪跑总结",
+    }
+    label = labels.get(record.event_type, "陪跑事件")
+    pieces = [label]
+    if record.coaching_state:
+        pieces.append(record.coaching_state)
+    if record.target_goal:
+        pieces.append(record.target_goal)
+    return " / ".join(pieces)
