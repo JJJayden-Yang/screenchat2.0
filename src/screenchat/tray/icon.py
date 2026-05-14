@@ -1,5 +1,6 @@
 import os
 import subprocess
+from datetime import datetime, timezone
 
 import rumps
 
@@ -36,10 +37,11 @@ class ScreenChatTray(rumps.App):
         mute_item = rumps.MenuItem(label, callback=self._on_toggle_mute)
         items = []
         if self._coaching_active():
-            summary = self.coaching_status.get("summary", "陪跑中")
+            summary = self._coaching_summary()
             status_item = rumps.MenuItem(summary, callback=None)
             items.extend([
                 status_item,
+                self._pause_menu_item(),
                 rumps.MenuItem("结束陪跑", callback=self._on_stop_coaching),
                 None,
             ])
@@ -47,6 +49,7 @@ class ScreenChatTray(rumps.App):
             items.append(rumps.MenuItem("开始陪跑...", callback=self._on_start_coaching))
         items.extend([
             mute_item,
+            rumps.MenuItem("专注星图...", callback=self._on_focus_dashboard),
             rumps.MenuItem("对话...", callback=self._on_chat),
             rumps.MenuItem("偏好设置...", callback=self._on_settings),
             None,
@@ -59,6 +62,31 @@ class ScreenChatTray(rumps.App):
             return bool(self.coaching_status and self.coaching_status.get("active", False))
         except Exception:
             return False
+
+    def _coaching_summary(self):
+        try:
+            goal = self.coaching_status.get("goal", "")
+            ends_at = self.coaching_status.get("ends_at", "")
+            if ends_at:
+                end = datetime.fromisoformat(ends_at)
+                remain = max(0, int((end - datetime.now(timezone.utc)).total_seconds()))
+                minutes = remain // 60
+                seconds = remain % 60
+                goal = goal if len(goal) <= 12 else goal[:12] + "..."
+                return f"陪跑中：{goal} {minutes:02d}:{seconds:02d}"
+            return self.coaching_status.get("summary", "陪跑中")
+        except Exception:
+            return "陪跑中"
+
+    def _pause_menu_item(self):
+        try:
+            if self.coaching_status.get("paused", False):
+                return rumps.MenuItem("▶ 继续专注", callback=self._on_toggle_pause)
+            if int(self.coaching_status.get("pause_count", 0)) >= 2:
+                return rumps.MenuItem("Ⅱ 暂停已用完", callback=None)
+        except Exception:
+            pass
+        return rumps.MenuItem("Ⅱ 暂停专注", callback=self._on_toggle_pause)
 
     def _refresh_menu(self, _timer):
         self._build_menu()
@@ -80,6 +108,10 @@ class ScreenChatTray(rumps.App):
         if self.ui_queue:
             self.ui_queue.put("chat")
 
+    def _on_focus_dashboard(self, _sender):
+        if self.ui_queue:
+            self.ui_queue.put("focus_dashboard")
+
     def _on_settings(self, _sender):
         if self.ui_queue:
             self.ui_queue.put("settings")
@@ -91,6 +123,10 @@ class ScreenChatTray(rumps.App):
     def _on_stop_coaching(self, _sender):
         if self.ui_queue:
             self.ui_queue.put("coach_stop")
+
+    def _on_toggle_pause(self, _sender):
+        if self.ui_queue:
+            self.ui_queue.put("coach_pause_toggle")
 
 
 def run_tray(comment_queue, ui_queue, muted_val, src_path, coaching_status=None):

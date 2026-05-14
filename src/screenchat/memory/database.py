@@ -43,6 +43,10 @@ def init():
         "ALTER TABLE conversations ADD COLUMN target_goal TEXT DEFAULT ''",
         "ALTER TABLE conversations ADD COLUMN goal_type TEXT DEFAULT ''",
         "ALTER TABLE conversations ADD COLUMN intensity TEXT DEFAULT ''",
+        "ALTER TABLE conversations ADD COLUMN planned_minutes INTEGER DEFAULT 0",
+        "ALTER TABLE conversations ADD COLUMN focused_seconds INTEGER DEFAULT 0",
+        "ALTER TABLE conversations ADD COLUMN pause_count INTEGER DEFAULT 0",
+        "ALTER TABLE conversations ADD COLUMN ended_early INTEGER DEFAULT 0",
     ):
         try:
             db.execute(stmt)
@@ -76,14 +80,19 @@ def insert_coaching_event(
     target_goal: str = "",
     goal_type: str = "",
     intensity: str = "",
+    planned_minutes: int = 0,
+    focused_seconds: int = 0,
+    pause_count: int = 0,
+    ended_early: bool = False,
 ):
     now = datetime.now(tz=timezone.utc).isoformat()
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     db = _connect()
     db.execute(
         "INSERT INTO conversations (date, screen_summary, comment, category, created_at, role, "
-        "event_type, coaching_state, target_relevance, suggested_action, target_goal, goal_type, intensity) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "event_type, coaching_state, target_relevance, suggested_action, target_goal, goal_type, intensity, "
+        "planned_minutes, focused_seconds, pause_count, ended_early) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             today,
             screen_summary,
@@ -98,6 +107,10 @@ def insert_coaching_event(
             target_goal,
             goal_type,
             intensity,
+            int(planned_minutes or 0),
+            int(focused_seconds or 0),
+            int(pause_count or 0),
+            1 if ended_early else 0,
         ),
     )
     db.commit()
@@ -110,7 +123,8 @@ def get_today() -> list[Conversation]:
     try:
         rows = db.execute(
             "SELECT date, screen_summary, comment, category, created_at, role, "
-            "event_type, coaching_state, target_relevance, suggested_action, target_goal, goal_type, intensity "
+            "event_type, coaching_state, target_relevance, suggested_action, target_goal, goal_type, intensity, "
+            "planned_minutes, focused_seconds, pause_count, ended_early "
             "FROM conversations WHERE date = ? ORDER BY created_at",
             (today,),
         ).fetchall()
@@ -127,5 +141,23 @@ def get_today() -> list[Conversation]:
                 "FROM conversations WHERE date = ? ORDER BY created_at",
                 (today,),
             ).fetchall()
+    db.close()
+    return [Conversation(*r) for r in rows]
+
+
+def get_all() -> list[Conversation]:
+    db = _connect()
+    try:
+        rows = db.execute(
+            "SELECT date, screen_summary, comment, category, created_at, role, "
+            "event_type, coaching_state, target_relevance, suggested_action, target_goal, goal_type, intensity, "
+            "planned_minutes, focused_seconds, pause_count, ended_early "
+            "FROM conversations ORDER BY created_at",
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = db.execute(
+            "SELECT date, screen_summary, comment, category, created_at, role "
+            "FROM conversations ORDER BY created_at",
+        ).fetchall()
     db.close()
     return [Conversation(*r) for r in rows]

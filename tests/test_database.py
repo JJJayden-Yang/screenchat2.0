@@ -27,6 +27,10 @@ class DatabaseCoachingEventTests(unittest.TestCase):
             target_goal="写完 README",
             goal_type="学习/看文档",
             intensity="标准",
+            planned_minutes=45,
+            focused_seconds=1800,
+            pause_count=1,
+            ended_early=True,
         )
 
         records = database.get_today()
@@ -36,6 +40,29 @@ class DatabaseCoachingEventTests(unittest.TestCase):
         self.assertEqual(records[0].coaching_state, "distracted")
         self.assertEqual(records[0].target_goal, "写完 README")
         self.assertEqual(records[0].suggested_action, "切回编辑器")
+        self.assertEqual(records[0].planned_minutes, 45)
+        self.assertEqual(records[0].focused_seconds, 1800)
+        self.assertEqual(records[0].pause_count, 1)
+        self.assertTrue(records[0].ended_early)
+
+    def test_get_all_returns_focus_history_for_dashboard(self):
+        database.insert_coaching_event(
+            "auto_end",
+            "完成专注：写代码",
+            target_goal="写代码",
+            goal_type="写代码/修 bug",
+            intensity="标准",
+            planned_minutes=45,
+            focused_seconds=2700,
+            pause_count=0,
+            ended_early=False,
+        )
+
+        records = database.get_all()
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].event_type, "auto_end")
+        self.assertEqual(records[0].focused_seconds, 2700)
 
 
 if __name__ == "__main__":

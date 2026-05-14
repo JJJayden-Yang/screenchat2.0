@@ -6,6 +6,9 @@ from screenchat.coaching import (
     CoachingIntensity,
     CoachingSession,
     CoachingState,
+    build_focus_summary,
+    manual_end_notification,
+    next_check_interval,
     parse_analysis,
     should_interrupt,
     valid_action_message,
@@ -132,6 +135,146 @@ class CoachingStateTests(unittest.TestCase):
                 "这个视频页和『写完 README』不太相关，已经停了 6 分钟。要不要先切回编辑器？"
             )
         )
+
+    def test_standard_check_interval_backs_off_until_fifteen_minutes(self):
+        interval = 60
+        for expected in (120, 240, 480, 900, 900):
+            interval = next_check_interval(interval, CoachingState.ON_TRACK, CoachingIntensity.STANDARD)
+            self.assertEqual(interval, expected)
+
+    def test_light_check_interval_starts_slower_and_caps_at_fifteen_minutes(self):
+        interval = 120
+        for expected in (300, 600, 900, 900):
+            interval = next_check_interval(interval, CoachingState.ON_TRACK, CoachingIntensity.LIGHT)
+            self.assertEqual(interval, expected)
+
+    def test_strict_check_interval_checks_more_often_and_caps_at_eight_minutes(self):
+        interval = 60
+        for expected in (120, 240, 480, 480):
+            interval = next_check_interval(interval, CoachingState.ON_TRACK, CoachingIntensity.STRICT)
+            self.assertEqual(interval, expected)
+
+    def test_check_interval_resets_after_distracted_or_stuck(self):
+        self.assertEqual(next_check_interval(900, CoachingState.DISTRACTED, CoachingIntensity.LIGHT), 120)
+        self.assertEqual(next_check_interval(900, CoachingState.STUCK, CoachingIntensity.STANDARD), 60)
+        self.assertEqual(next_check_interval(900, CoachingState.STUCK, CoachingIntensity.STRICT), 60)
+
+    def test_unclear_keeps_current_interval(self):
+        self.assertEqual(next_check_interval(240, CoachingState.UNCLEAR, CoachingIntensity.STANDARD), 240)
+
+    def test_pause_extends_end_time_and_is_limited_to_two_minutes(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="写代码",
+            goal_type="写代码/修 bug",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+
+        self.assertTrue(session.pause(started + timedelta(minutes=10)))
+        self.assertTrue(session.is_paused(started + timedelta(minutes=11)))
+        self.assertFalse(session.is_paused(started + timedelta(minutes=13)))
+        self.assertEqual(session.pause_count, 1)
+        self.assertEqual(session.ends_at, started + timedelta(minutes=47))
+
+    def test_pause_is_limited_to_two_times_per_session(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="写代码",
+            goal_type="写代码/修 bug",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+
+        self.assertTrue(session.pause(started + timedelta(minutes=1)))
+        session.resume(started + timedelta(minutes=2))
+        self.assertTrue(session.pause(started + timedelta(minutes=5)))
+        session.resume(started + timedelta(minutes=6))
+        self.assertFalse(session.pause(started + timedelta(minutes=9)))
+        self.assertEqual(session.pause_count, 2)
+
+    def test_manual_end_before_time_gets_encouraging_notification(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="写代码",
+            goal_type="写代码/修 bug",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+
+        message = manual_end_notification(session, started + timedelta(minutes=20))
+
+        self.assertIn("先到这里", message)
+        self.assertIn("写代码", message)
+
+    def test_manual_end_after_time_uses_normal_notification(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="写代码",
+            goal_type="写代码/修 bug",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+
+        message = manual_end_notification(session, started + timedelta(minutes=46))
+
+        self.assertEqual(message, "陪跑结束，已生成本轮总结。")
+
+    def test_focus_summary_counts_time_pauses_and_early_end(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="写 todo 再写代码",
+            goal_type="写代码/修 bug",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+        self.assertTrue(session.pause(started + timedelta(minutes=10)))
+        session.resume(started + timedelta(minutes=11, seconds=30))
+
+        summary = build_focus_summary(
+            session,
+            now=started + timedelta(minutes=20),
+            reason="manual_end",
+            message_index=0,
+        )
+
+        self.assertTrue(summary.ended_early)
+        self.assertEqual(summary.planned_minutes, 45)
+        self.assertEqual(summary.focused_seconds, 1110)
+        self.assertEqual(summary.pause_count, 1)
+        self.assertEqual(summary.paused_seconds, 90)
+        self.assertIn("本轮专注了 18 分 30 秒", summary.text)
+        self.assertIn("暂停 1 次", summary.text)
+        self.assertIn("没关系", summary.text)
+        self.assertNotIn("上下文掉线", summary.text)
+
+    def test_focus_summary_uses_completion_praise_library(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="看学习视频",
+            goal_type="学习/看文档",
+            duration_minutes=25,
+            intensity=CoachingIntensity.LIGHT,
+            started_at=started,
+        )
+
+        summary = build_focus_summary(
+            session,
+            now=started + timedelta(minutes=25),
+            reason="auto_end",
+            message_index=1,
+        )
+
+        self.assertFalse(summary.ended_early)
+        self.assertEqual(summary.focused_seconds, 1500)
+        self.assertIn("完成专注", summary.text)
+        self.assertIn("25 分钟", summary.text)
+        self.assertNotEqual(summary.message, "陪跑结束，已生成本轮总结。")
 
 
 if __name__ == "__main__":

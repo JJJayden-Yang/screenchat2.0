@@ -44,6 +44,12 @@ INTENSITY_RULES = {
     ),
 }
 
+CHECK_BACKOFF_STEPS = {
+    CoachingIntensity.LIGHT: (120, 300, 600, 900),
+    CoachingIntensity.STANDARD: (60, 120, 240, 480, 900),
+    CoachingIntensity.STRICT: (60, 120, 240, 480),
+}
+
 
 @dataclass
 class CoachingSession:
@@ -53,6 +59,10 @@ class CoachingSession:
     intensity: CoachingIntensity
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     reminder_count: int = 0
+    check_interval_seconds: int = 60
+    pause_count: int = 0
+    paused_until: datetime | None = None
+    total_paused: timedelta = field(default_factory=timedelta)
     last_state: CoachingState = CoachingState.UNCLEAR
     state_started_at: datetime | None = None
     last_reminders: list[str] = field(default_factory=list)
@@ -61,12 +71,13 @@ class CoachingSession:
     def __post_init__(self):
         if isinstance(self.intensity, str):
             self.intensity = parse_intensity(self.intensity)
+        self.check_interval_seconds = CHECK_BACKOFF_STEPS[self.intensity][0]
         if self.state_started_at is None:
             self.state_started_at = self.started_at
 
     @property
     def ends_at(self) -> datetime:
-        return self.started_at + timedelta(minutes=self.duration_minutes)
+        return self.started_at + timedelta(minutes=self.duration_minutes) + self.total_paused
 
     def is_expired(self, now: datetime | None = None) -> bool:
         now = now or datetime.now(timezone.utc)
@@ -75,6 +86,31 @@ class CoachingSession:
     def remaining_seconds(self, now: datetime | None = None) -> int:
         now = now or datetime.now(timezone.utc)
         return max(0, int((self.ends_at - now).total_seconds()))
+
+    def is_paused(self, now: datetime | None = None) -> bool:
+        now = now or datetime.now(timezone.utc)
+        if self.paused_until is None:
+            return False
+        if now >= self.paused_until:
+            self.resume(self.paused_until)
+            return False
+        return True
+
+    def pause(self, now: datetime | None = None) -> bool:
+        now = now or datetime.now(timezone.utc)
+        if self.pause_count >= 2 or self.is_paused(now):
+            return False
+        self.pause_count += 1
+        self.paused_until = now + timedelta(minutes=2)
+        self.total_paused += timedelta(minutes=2)
+        return True
+
+    def resume(self, now: datetime | None = None):
+        now = now or datetime.now(timezone.utc)
+        if self.paused_until and now < self.paused_until:
+            unused = self.paused_until - now
+            self.total_paused -= unused
+        self.paused_until = None
 
     def update_state(self, state: CoachingState, now: datetime, summary: str = ""):
         if state != self.last_state:
@@ -86,6 +122,13 @@ class CoachingSession:
         self.reminder_count += 1
         self.last_reminders.append(message)
         self.last_reminders = self.last_reminders[-5:]
+
+    def advance_check_interval(self, state: CoachingState):
+        self.check_interval_seconds = next_check_interval(
+            self.check_interval_seconds,
+            state,
+            self.intensity,
+        )
 
     def menu_summary(self, now: datetime | None = None) -> str:
         remain = self.remaining_seconds(now)
@@ -113,6 +156,33 @@ class InterruptDecision:
     state: CoachingState
 
 
+@dataclass(frozen=True)
+class FocusSummary:
+    goal: str
+    goal_type: str
+    intensity: CoachingIntensity
+    planned_minutes: int
+    focused_seconds: int
+    pause_count: int
+    paused_seconds: int
+    ended_early: bool
+    message: str
+    text: str
+
+
+COMPLETION_MESSAGES = (
+    "完成专注，这轮很扎实。你把注意力留在了真正重要的事情上。",
+    "完成专注，漂亮。稳定推进比一口气冲很远更可靠。",
+    "完成专注，今天的星图又多了一颗亮星。",
+)
+
+EARLY_END_MESSAGES = (
+    "没关系，这轮先停在这里也算数。已经开始、已经推进，就不是空白。",
+    "没关系，提前收尾不是失败。把状态留住，下一轮会更容易接上。",
+    "没关系，能意识到该停下来本身也是一种掌控感。",
+)
+
+
 def parse_intensity(value: str | CoachingIntensity) -> CoachingIntensity:
     if isinstance(value, CoachingIntensity):
         return value
@@ -134,6 +204,99 @@ def parse_state(value: str | CoachingState) -> CoachingState:
         return CoachingState(str(value).strip())
     except ValueError:
         return CoachingState.UNCLEAR
+
+
+def next_check_interval(
+    current_seconds: int,
+    state: CoachingState,
+    intensity: CoachingIntensity = CoachingIntensity.STANDARD,
+) -> int:
+    state = parse_state(state)
+    intensity = parse_intensity(intensity)
+    steps = CHECK_BACKOFF_STEPS[intensity]
+    if state in (CoachingState.DISTRACTED, CoachingState.STUCK):
+        return steps[0]
+    if state == CoachingState.UNCLEAR:
+        return current_seconds
+    try:
+        index = steps.index(current_seconds)
+    except ValueError:
+        index = 0
+        for i, value in enumerate(steps):
+            if current_seconds <= value:
+                index = i
+                break
+        else:
+            index = len(steps) - 1
+    return steps[min(index + 1, len(steps) - 1)]
+
+
+def manual_end_notification(session: CoachingSession, now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    if now < session.ends_at:
+        return f"这轮「{session.goal}」先到这里也没关系，已经比完全没开始强很多。歇一下，下一轮再接着来。"
+    return "陪跑结束，已生成本轮总结。"
+
+
+def _pick_message(messages: tuple[str, ...], session: CoachingSession, message_index: int | None) -> str:
+    if message_index is None:
+        seed = f"{session.goal}|{session.started_at.isoformat()}|{session.pause_count}"
+        message_index = sum(ord(ch) for ch in seed)
+    return messages[message_index % len(messages)]
+
+
+def _used_pause_seconds(session: CoachingSession, now: datetime) -> int:
+    paused = session.total_paused
+    if session.paused_until and now < session.paused_until:
+        paused -= session.paused_until - now
+    return max(0, int(paused.total_seconds()))
+
+
+def _format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes, second = divmod(seconds, 60)
+    if minutes <= 0:
+        return f"{second} 秒"
+    if second == 0:
+        return f"{minutes} 分钟"
+    return f"{minutes} 分 {second} 秒"
+
+
+def build_focus_summary(
+    session: CoachingSession,
+    now: datetime | None = None,
+    reason: str = "manual_end",
+    message_index: int | None = None,
+) -> FocusSummary:
+    now = now or datetime.now(timezone.utc)
+    ended_early = reason != "auto_end" and now < session.ends_at
+    paused_seconds = _used_pause_seconds(session, now)
+    elapsed_seconds = max(0, int((now - session.started_at).total_seconds()))
+    focused_seconds = max(0, elapsed_seconds - paused_seconds)
+    planned_seconds = session.duration_minutes * 60
+    focused_seconds = min(focused_seconds, planned_seconds)
+    messages = EARLY_END_MESSAGES if ended_early else COMPLETION_MESSAGES
+    message = _pick_message(messages, session, message_index)
+
+    status = "提前结束" if ended_early else "完成专注"
+    text = (
+        f"{status}：{session.goal}\n"
+        f"本轮专注了 {_format_duration(focused_seconds)}，计划 {session.duration_minutes} 分钟。\n"
+        f"暂停 {session.pause_count} 次，共 {_format_duration(paused_seconds)}。\n"
+        f"{message}"
+    )
+    return FocusSummary(
+        goal=session.goal,
+        goal_type=session.goal_type,
+        intensity=session.intensity,
+        planned_minutes=session.duration_minutes,
+        focused_seconds=focused_seconds,
+        pause_count=session.pause_count,
+        paused_seconds=paused_seconds,
+        ended_early=ended_early,
+        message=message,
+        text=text,
+    )
 
 
 def _extract_json(raw: str) -> dict | None:
@@ -272,18 +435,4 @@ def build_prompt(session: CoachingSession) -> str:
 
 
 def build_summary(session: CoachingSession) -> str:
-    if not session.state_log:
-        detail = "这轮没有记录到明显推进或偏离片段。"
-    else:
-        parts = []
-        for _, state, summary in session.state_log[-6:]:
-            label = state.value
-            text = summary or "无截图概括"
-            parts.append(f"{label}: {text}")
-        detail = "；".join(parts)
-    return (
-        f"本轮陪跑结束：{session.goal}。\n"
-        f"目标类型：{session.goal_type}，强度：{session.intensity.value}。\n"
-        f"主要记录：{detail}\n"
-        "下一步：挑一个最小动作继续推进，别让上下文掉线。"
-    )
+    return build_focus_summary(session).text

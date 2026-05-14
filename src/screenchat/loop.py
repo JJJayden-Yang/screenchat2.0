@@ -22,8 +22,8 @@ import mss
 
 from screenchat.coaching import (
     CoachingSession,
+    build_focus_summary,
     build_prompt as build_coaching_prompt,
-    build_summary as build_coaching_summary,
     parse_analysis as parse_coaching_analysis,
     should_interrupt as should_coaching_interrupt,
 )
@@ -274,6 +274,11 @@ class ScreenChat:
         if status is not None and session is not None:
             status["active"] = True
             status["summary"] = session.menu_summary(now)
+            status["goal"] = session.goal
+            status["ends_at"] = session.ends_at.isoformat()
+            status["paused"] = session.is_paused(now)
+            status["paused_until"] = session.paused_until.isoformat() if session.paused_until else ""
+            status["pause_count"] = session.pause_count
 
     # ── Layer 2：场景摘要压缩 ─────────────────────────
 
@@ -328,11 +333,11 @@ class ScreenChat:
         print("[小幕] 按 Ctrl+C 退出\n")
 
         while self.running:
+            sleep_interval = self.config["capture_interval"]
             try:
                 t0 = time.time()
                 session = self._current_session()
                 if session is None:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] · (idle)")
                     time.sleep(self.config["capture_interval"])
                     continue
 
@@ -343,6 +348,12 @@ class ScreenChat:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] 💬 陪跑结束")
                     time.sleep(self.config["capture_interval"])
                     continue
+                sleep_interval = session.check_interval_seconds
+                if session.is_paused(now):
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] · (paused)")
+                    self._update_coaching_status_locked(session, now)
+                    time.sleep(min(10, max(1, int((session.paused_until - now).total_seconds()))))
+                    continue
 
                 # ① 截图
                 b64, img = self.capture()
@@ -351,21 +362,19 @@ class ScreenChat:
                 dhash = imagehash.dhash(img)
                 if self._last_dhash is not None and (self._last_dhash - dhash) < 5:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] · (dup)")
+                    session.advance_check_interval(session.last_state)
+                    sleep_interval = session.check_interval_seconds
                     self._update_coaching_status_locked(session)
-                    elapsed = time.time() - t0
-                    sleep_time = max(0, self.config["capture_interval"] - elapsed)
                     if self.running:
-                        time.sleep(sleep_time)
+                        time.sleep(sleep_interval)
                     continue
                 self._last_dhash = dhash
 
                 # ③ 静音检查
                 if self.shared.value:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] · (muted)")
-                    elapsed = time.time() - t0
-                    sleep_time = max(0, self.config["capture_interval"] - elapsed)
                     if self.running:
-                        time.sleep(sleep_time)
+                        time.sleep(sleep_interval)
                     continue
 
                 # ④ 陪跑 AI 分析
@@ -373,6 +382,22 @@ class ScreenChat:
                 analysis = parse_coaching_analysis(raw)
                 now = datetime.now(timezone.utc)
                 self._record_coaching_state(session, analysis, now)
+                try:
+                    from screenchat.memory import database as memdb
+                    if analysis.screen_summary:
+                        memdb.insert_coaching_event(
+                            "observation",
+                            analysis.target_relevance or analysis.screen_summary,
+                            screen_summary=analysis.screen_summary,
+                            coaching_state=analysis.state.value,
+                            target_relevance=analysis.target_relevance,
+                            suggested_action=analysis.suggested_action,
+                            target_goal=session.goal,
+                            goal_type=session.goal_type,
+                            intensity=session.intensity.value,
+                        )
+                except Exception:
+                    pass
                 decision = should_coaching_interrupt(
                     session,
                     analysis.state,
@@ -409,6 +434,8 @@ class ScreenChat:
                     self._compress_history()
                 else:
                     print(f"[{ts}] · ({decision.state.value}: {decision.reason})")
+                session.advance_check_interval(decision.state)
+                sleep_interval = session.check_interval_seconds
 
             except json.JSONDecodeError:
                 # AI 有时不听话——试试从文本里抠 JSON
@@ -425,12 +452,8 @@ class ScreenChat:
                 # 截图失败、网络问题等都兜住，不让循环崩
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ {e}")
 
-            # 精确计时：用 sleep 时间补 AI 调用 + 截图耗时
-            # 如果 AI 调用了 5 秒，就只 sleep 15 秒，保证总周期约 20 秒
-            elapsed = time.time() - t0
-            sleep_time = max(0, self.config["capture_interval"] - elapsed)
             if self.running:
-                time.sleep(sleep_time)
+                time.sleep(sleep_interval)
 
 
 # ── 入口 ──────────────────────────────────────────────────
@@ -477,9 +500,19 @@ def main():
         if session is None:
             mp_coaching_status["active"] = False
             mp_coaching_status["summary"] = ""
+            mp_coaching_status["goal"] = ""
+            mp_coaching_status["ends_at"] = ""
+            mp_coaching_status["paused"] = False
+            mp_coaching_status["paused_until"] = ""
+            mp_coaching_status["pause_count"] = 0
         else:
             mp_coaching_status["active"] = True
             mp_coaching_status["summary"] = session.menu_summary()
+            mp_coaching_status["goal"] = session.goal
+            mp_coaching_status["ends_at"] = session.ends_at.isoformat()
+            mp_coaching_status["paused"] = session.is_paused()
+            mp_coaching_status["paused_until"] = session.paused_until.isoformat() if session.paused_until else ""
+            mp_coaching_status["pause_count"] = session.pause_count
 
     def _start_coaching(goal: str, goal_type: str, duration_minutes: int, intensity: str):
         session = CoachingSession(
@@ -502,6 +535,8 @@ def main():
             )
         except Exception:
             pass
+        if mp_comment is not None:
+            mp_comment.put(f"开始陪跑：{goal}（{duration_minutes} 分钟，{session.intensity.value}）")
         print(f"[小幕] 开始陪跑：{goal}（{goal_type} / {session.intensity.value} / {duration_minutes} 分钟）")
 
     def _finish_coaching(reason: str = "manual_end"):
@@ -512,24 +547,47 @@ def main():
                 return ""
             coaching_context["session"] = None
             _set_coaching_status(None)
-        summary = build_coaching_summary(session)
+        now = datetime.now(timezone.utc)
+        summary = build_focus_summary(session, now=now, reason=reason)
         event_type = "auto_end" if reason == "auto_end" else "manual_end"
         try:
             memdb.insert_coaching_event(
                 event_type,
-                summary,
+                summary.text,
                 target_goal=session.goal,
                 goal_type=session.goal_type,
                 intensity=session.intensity.value,
+                planned_minutes=summary.planned_minutes,
+                focused_seconds=summary.focused_seconds,
+                pause_count=summary.pause_count,
+                ended_early=summary.ended_early,
             )
         except Exception:
             pass
         message_history.append({"role": "user", "content": f"刚结束陪跑：{session.goal}"})
-        message_history.append({"role": "assistant", "content": summary})
+        message_history.append({"role": "assistant", "content": summary.text})
         if mp_comment is not None:
-            mp_comment.put("陪跑结束，已生成本轮总结。")
+            mp_comment.put(summary.message)
         print(f"[小幕] 陪跑结束：{session.goal}")
-        return summary
+        return summary.text
+
+    def _toggle_pause_coaching():
+        with coaching_context["lock"]:
+            session = coaching_context.get("session")
+            if session is None:
+                return
+            now = datetime.now(timezone.utc)
+            if session.is_paused(now):
+                session.resume(now)
+                message = "继续专注，小幕回到陪跑状态。"
+            elif session.pause(now):
+                message = f"已暂停专注 2 分钟（本轮第 {session.pause_count}/2 次）。"
+            else:
+                message = "本轮暂停次数已经用完啦，先把这一小段收个尾。"
+            _set_coaching_status(session)
+        if mp_comment is not None:
+            mp_comment.put(message)
+        print(f"[小幕] {message}")
 
     def _run_loop():
         app = ScreenChat(config, comment_queue=mp_comment,
@@ -618,11 +676,18 @@ def main():
             elif action == "settings":
                 from screenchat.ui.settings_window import open_settings
                 open_settings()
+            elif action == "focus_dashboard":
+                from screenchat.memory import database as memdb
+                from screenchat.ui.focus_dashboard import open_dashboard
+                memdb.init()
+                open_dashboard(memdb.get_all())
             elif action == "coach_start":
                 from screenchat.ui.coaching_window import open_coaching
                 open_coaching(_start_coaching)
             elif action == "coach_stop":
                 _finish_coaching("manual_end")
+            elif action == "coach_pause_toggle":
+                _toggle_pause_coaching()
         except Exception:
             pass
         root.after(500, _check_ui)
