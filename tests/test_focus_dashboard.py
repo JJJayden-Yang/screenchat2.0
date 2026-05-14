@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime
 
 from screenchat.memory.models import Conversation
 from screenchat.ui.focus_dashboard import build_dashboard_payload, render_dashboard_html, write_dashboard
@@ -169,12 +170,64 @@ class FocusDashboardTests(unittest.TestCase):
         payload = build_dashboard_payload(records)
         timeline = payload["weeks"][0]["stars"][0]["timeline"]
 
-        self.assertEqual(timeline[0]["time"], "09:00")
+        self.assertEqual(
+            timeline[0]["time"],
+            datetime.fromisoformat("2026-05-13T09:00:00+00:00").astimezone().strftime("%H:%M"),
+        )
         self.assertIn("开始陪跑", timeline[0]["text"])
-        self.assertEqual(timeline[1]["time"], "09:15")
+        self.assertEqual(
+            timeline[1]["time"],
+            datetime.fromisoformat("2026-05-13T09:15:00+00:00").astimezone().strftime("%H:%M"),
+        )
         self.assertIn("屏幕显示视频课程", timeline[1]["text"])
         self.assertEqual(timeline[2]["state"], "distracted")
         self.assertIn("完成专注", timeline[-1]["text"])
+
+    def test_timeline_displays_local_time_from_utc_records(self):
+        created_at = "2026-05-13T09:15:00+00:00"
+        expected_local = datetime.fromisoformat(created_at).astimezone().strftime("%H:%M")
+        records = [
+            Conversation(
+                date="2026-05-13",
+                screen_summary="",
+                comment="开始陪跑：学视频项目",
+                category="coaching",
+                created_at="2026-05-13T09:00:00+00:00",
+                event_type="start",
+                target_goal="学视频项目",
+                goal_type="学习/看文档",
+                intensity="标准",
+            ),
+            Conversation(
+                date="2026-05-13",
+                screen_summary="屏幕显示视频课程",
+                comment="用户正在看课程。",
+                category="coaching",
+                created_at=created_at,
+                event_type="observation",
+                coaching_state="on_track",
+                target_goal="学视频项目",
+                goal_type="学习/看文档",
+                intensity="标准",
+            ),
+            Conversation(
+                date="2026-05-13",
+                screen_summary="",
+                comment="完成专注：学视频项目\n本轮专注了 60 分钟，计划 60 分钟。",
+                category="coaching",
+                created_at="2026-05-13T10:00:00+00:00",
+                event_type="auto_end",
+                target_goal="学视频项目",
+                goal_type="学习/看文档",
+                intensity="标准",
+                planned_minutes=60,
+                focused_seconds=3600,
+            ),
+        ]
+
+        payload = build_dashboard_payload(records)
+
+        self.assertEqual(payload["weeks"][0]["stars"][0]["timeline"][1]["time"], expected_local)
 
     def test_render_dashboard_embeds_payload_and_three_scene(self):
         payload = {
@@ -192,6 +245,8 @@ class FocusDashboardTests(unittest.TestCase):
         self.assertIn("夜间 UI", html)
         self.assertIn("天体科普", html)
         self.assertIn("本轮专注记录", html)
+        self.assertIn("待机时间", html)
+        self.assertIn("focusIdle", html)
         self.assertIn("focusTimeline", html)
         self.assertIn("timeline-section", html)
         self.assertIn("overflow-y: auto", html)
@@ -219,9 +274,62 @@ class FocusDashboardTests(unittest.TestCase):
         self.assertIn("camera.position.set(0, 38, 132)", html)
         self.assertIn("Math.min(620", html)
         self.assertIn("Math.max(6", html)
+        self.assertIn("object.rotation.y += 0.0016", html)
+        self.assertIn("object.rotation.x += 0.0006", html)
+        self.assertIn("orbitSpeed = 0.004", html)
         self.assertIn("scene.fog = new THREE.FogExp2(0x02040a, 0.0026)", html)
         self.assertIn("new THREE.AmbientLight(0xb8dcff, 0.92)", html)
         self.assertIn(json.dumps(payload, ensure_ascii=False), html)
+
+    def test_payload_includes_idle_events_and_idle_seconds(self):
+        records = [
+            Conversation(
+                date="2026-05-13",
+                screen_summary="",
+                comment="开始陪跑：学视频项目",
+                category="coaching",
+                created_at="2026-05-13T09:00:00+00:00",
+                event_type="start",
+                target_goal="学视频项目",
+                goal_type="学习/看文档",
+                intensity="标准",
+            ),
+            Conversation(
+                date="2026-05-13",
+                screen_summary="屏幕连续 5 分钟未变化",
+                comment="屏幕连续 5 分钟未变化，可能离开了电脑。",
+                category="coaching",
+                created_at="2026-05-13T09:05:00+00:00",
+                event_type="idle",
+                coaching_state="idle",
+                target_goal="学视频项目",
+                goal_type="学习/看文档",
+                intensity="标准",
+                idle_seconds=300,
+            ),
+            Conversation(
+                date="2026-05-13",
+                screen_summary="",
+                comment="完成专注：学视频项目\n本轮专注了 60 分钟，计划 60 分钟。",
+                category="coaching",
+                created_at="2026-05-13T10:00:00+00:00",
+                event_type="auto_end",
+                target_goal="学视频项目",
+                goal_type="学习/看文档",
+                intensity="标准",
+                planned_minutes=60,
+                focused_seconds=3600,
+                idle_seconds=300,
+            ),
+        ]
+
+        payload = build_dashboard_payload(records)
+        star = payload["weeks"][0]["stars"][0]
+
+        self.assertEqual(payload["totals"]["idle_seconds"], 300)
+        self.assertEqual(star["idle_seconds"], 300)
+        self.assertEqual(star["timeline"][1]["state"], "idle")
+        self.assertIn("屏幕连续 5 分钟未变化", star["timeline"][1]["text"])
 
     def test_write_dashboard_creates_self_contained_html(self):
         with tempfile.TemporaryDirectory() as tmp:

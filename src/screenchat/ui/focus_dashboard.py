@@ -230,7 +230,7 @@ def _short_summary(comment: str) -> str:
 
 
 def _format_time(value: str) -> str:
-    return _parse_datetime(value).strftime("%H:%M")
+    return _parse_datetime(value).astimezone().strftime("%H:%M")
 
 
 def _event_text(record: Conversation) -> str:
@@ -243,6 +243,8 @@ def _event_text(record: Conversation) -> str:
         if record.screen_summary and record.comment:
             return f"{record.screen_summary}。提醒：{record.comment}"
         return record.screen_summary or record.comment or "触发了一次陪跑提醒。"
+    if record.event_type == "idle":
+        return record.screen_summary or record.comment or "屏幕保持未变化，记录为待机时间。"
     return _short_summary(record.comment) or "本轮结束。"
 
 
@@ -263,7 +265,7 @@ def _timeline_for_record(record: Conversation, all_records: list[Conversation]) 
         related = [item for item in related if _parse_datetime(item.created_at) >= start_at]
     timeline = []
     for item in sorted(related, key=lambda value: _parse_datetime(value.created_at)):
-        if item.event_type not in ("start", "observation", "reminder", "auto_end", "manual_end"):
+        if item.event_type not in ("start", "observation", "reminder", "idle", "auto_end", "manual_end"):
             continue
         text = _event_text(item)
         if not text:
@@ -352,6 +354,7 @@ def _star_from_record(
         "focused_seconds": focused_seconds,
         "focused_minutes": focused_minutes,
         "pause_count": int(record.pause_count or 0),
+        "idle_seconds": int(record.idle_seconds or 0),
         "ended_early": bool(record.ended_early),
         "rarity": RARITY_LABELS[celestial["rarity"]],
         "rarity_rank": celestial["rarity"],
@@ -375,6 +378,7 @@ def build_dashboard_payload(records: list[Conversation]) -> dict:
         "completed": 0,
         "early": 0,
         "pause_count": 0,
+        "idle_seconds": 0,
     }
     used_names: set[str] = set()
     for index, record in enumerate(focus_records):
@@ -387,6 +391,7 @@ def build_dashboard_payload(records: list[Conversation]) -> dict:
         totals["sessions"] += 1
         totals["focused_seconds"] += star["focused_seconds"]
         totals["pause_count"] += star["pause_count"]
+        totals["idle_seconds"] += star["idle_seconds"]
         if star["ended_early"]:
             totals["early"] += 1
         else:
@@ -880,6 +885,7 @@ def render_dashboard_html(payload: dict) -> str:
           <div class="detail"><span>稀有度</span><strong id="focusRarity">--</strong></div>
           <div class="detail"><span>目标类型</span><strong id="focusType">--</strong></div>
           <div class="detail"><span>暂停次数</span><strong id="focusPause">--</strong></div>
+          <div class="detail"><span>待机时间</span><strong id="focusIdle">--</strong></div>
           <div class="detail"><span>状态</span><strong id="focusStatus">--</strong></div>
         </div>
         <div class="info-section">
@@ -1492,7 +1498,7 @@ def render_dashboard_html(payload: dict) -> str:
             );
             moon.position.set(planetRadius * 1.72, planetRadius * 0.26, 0);
             moon.userData.orbitRadius = planetRadius * 1.72;
-            moon.userData.orbitSpeed = 0.016 + starIndex * 0.001;
+            moon.userData.orbitSpeed = 0.004 + starIndex * 0.00025;
             moon.userData.orbitPhase = starIndex;
             mesh.add(moon);
             const moonOrbit = new THREE.Mesh(
@@ -1515,6 +1521,7 @@ def render_dashboard_html(payload: dict) -> str:
       setText("focusRarity", star.rarity);
       setText("focusType", star.goal_type);
       setText("focusPause", `${{star.pause_count}} 次`);
+      setText("focusIdle", minutes(star.idle_seconds || 0));
       setText("focusStatus", star.ended_early ? "提前结束" : "完成专注");
       const companion = star.celestial.companion ? ` 伴星：${{star.celestial.companion.name}}（${{star.celestial.companion.kind}}）。` : "";
       const source = star.celestial.source_note ? `\\n贴图来源：${{star.celestial.source_note}}` : "";
@@ -1595,8 +1602,8 @@ def render_dashboard_html(payload: dict) -> str:
       }}
       aimCamera();
       focusObjects.forEach((object, index) => {{
-        object.rotation.y += 0.004 + index * 0.0003;
-        object.rotation.x += 0.0015;
+        object.rotation.y += 0.0016 + index * 0.0001;
+        object.rotation.x += 0.0006;
         object.children.forEach(child => {{
           if (child.userData && child.userData.orbitRadius) {{
             child.userData.orbitPhase += child.userData.orbitSpeed;

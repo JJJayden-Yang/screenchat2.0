@@ -46,6 +46,7 @@ def init():
         "ALTER TABLE conversations ADD COLUMN planned_minutes INTEGER DEFAULT 0",
         "ALTER TABLE conversations ADD COLUMN focused_seconds INTEGER DEFAULT 0",
         "ALTER TABLE conversations ADD COLUMN pause_count INTEGER DEFAULT 0",
+        "ALTER TABLE conversations ADD COLUMN idle_seconds INTEGER DEFAULT 0",
         "ALTER TABLE conversations ADD COLUMN ended_early INTEGER DEFAULT 0",
     ):
         try:
@@ -83,6 +84,7 @@ def insert_coaching_event(
     planned_minutes: int = 0,
     focused_seconds: int = 0,
     pause_count: int = 0,
+    idle_seconds: int = 0,
     ended_early: bool = False,
 ):
     now = datetime.now(tz=timezone.utc).isoformat()
@@ -91,8 +93,8 @@ def insert_coaching_event(
     db.execute(
         "INSERT INTO conversations (date, screen_summary, comment, category, created_at, role, "
         "event_type, coaching_state, target_relevance, suggested_action, target_goal, goal_type, intensity, "
-        "planned_minutes, focused_seconds, pause_count, ended_early) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "planned_minutes, focused_seconds, pause_count, idle_seconds, ended_early) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             today,
             screen_summary,
@@ -110,6 +112,7 @@ def insert_coaching_event(
             int(planned_minutes or 0),
             int(focused_seconds or 0),
             int(pause_count or 0),
+            int(idle_seconds or 0),
             1 if ended_early else 0,
         ),
     )
@@ -124,7 +127,7 @@ def get_today() -> list[Conversation]:
         rows = db.execute(
             "SELECT date, screen_summary, comment, category, created_at, role, "
             "event_type, coaching_state, target_relevance, suggested_action, target_goal, goal_type, intensity, "
-            "planned_minutes, focused_seconds, pause_count, ended_early "
+            "planned_minutes, focused_seconds, pause_count, idle_seconds, ended_early "
             "FROM conversations WHERE date = ? ORDER BY created_at",
             (today,),
         ).fetchall()
@@ -151,7 +154,7 @@ def get_all() -> list[Conversation]:
         rows = db.execute(
             "SELECT date, screen_summary, comment, category, created_at, role, "
             "event_type, coaching_state, target_relevance, suggested_action, target_goal, goal_type, intensity, "
-            "planned_minutes, focused_seconds, pause_count, ended_early "
+            "planned_minutes, focused_seconds, pause_count, idle_seconds, ended_early "
             "FROM conversations ORDER BY created_at",
         ).fetchall()
     except sqlite3.OperationalError:

@@ -1,8 +1,32 @@
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import rumps
+
+
+def _format_seconds(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes, second = divmod(seconds, 60)
+    return f"{minutes:02d}:{second:02d}"
+
+
+def pause_menu_title(status, now: datetime | None = None) -> str:
+    """根据共享陪跑状态生成暂停菜单文案。"""
+    now = now or datetime.now(timezone.utc)
+    try:
+        if status and status.get("paused", False):
+            paused_until = status.get("paused_until", "")
+            remain = 0
+            if paused_until:
+                end = datetime.fromisoformat(paused_until)
+                remain = max(0, int((end - now).total_seconds()))
+            return f"▶ 继续专注（{_format_seconds(remain)}）"
+        if int(status.get("pause_count", 0)) >= 2:
+            return "Ⅱ 暂停已用完"
+    except Exception:
+        pass
+    return "Ⅱ 暂停专注"
 
 
 def _send_notification(comment: str):
@@ -79,14 +103,9 @@ class ScreenChatTray(rumps.App):
             return "陪跑中"
 
     def _pause_menu_item(self):
-        try:
-            if self.coaching_status.get("paused", False):
-                return rumps.MenuItem("▶ 继续专注", callback=self._on_toggle_pause)
-            if int(self.coaching_status.get("pause_count", 0)) >= 2:
-                return rumps.MenuItem("Ⅱ 暂停已用完", callback=None)
-        except Exception:
-            pass
-        return rumps.MenuItem("Ⅱ 暂停专注", callback=self._on_toggle_pause)
+        title = pause_menu_title(self.coaching_status)
+        callback = None if "已用完" in title else self._on_toggle_pause
+        return rumps.MenuItem(title, callback=callback)
 
     def _refresh_menu(self, _timer):
         self._build_menu()
@@ -98,8 +117,14 @@ class ScreenChatTray(rumps.App):
     def _check_queue(self, _timer):
         """检查多进程队列，有 AI 评论就弹通知（静音时跳过）。"""
         try:
-            comment = self.comment_queue.get_nowait()
-            if not self.muted_val.value:
+            item = self.comment_queue.get_nowait()
+            if isinstance(item, dict):
+                comment = item.get("message", "")
+                force = bool(item.get("force", False))
+            else:
+                comment = item
+                force = False
+            if force or not self.muted_val.value:
                 _send_notification(comment)
         except Exception:
             pass
@@ -127,6 +152,19 @@ class ScreenChatTray(rumps.App):
     def _on_toggle_pause(self, _sender):
         if self.ui_queue:
             self.ui_queue.put("coach_pause_toggle")
+        try:
+            if self.coaching_status:
+                if self.coaching_status.get("paused", False):
+                    self.coaching_status["paused"] = False
+                    self.coaching_status["paused_until"] = ""
+                else:
+                    self.coaching_status["paused"] = True
+                    self.coaching_status["paused_until"] = (
+                        datetime.now(timezone.utc).replace(microsecond=0) + timedelta(minutes=2)
+                    ).isoformat()
+        except Exception:
+            pass
+        self._build_menu()
 
 
 def run_tray(comment_queue, ui_queue, muted_val, src_path, coaching_status=None):

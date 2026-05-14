@@ -7,6 +7,8 @@ from screenchat.coaching import (
     CoachingSession,
     CoachingState,
     build_focus_summary,
+    fallback_intervention_message,
+    idle_reminder_message,
     manual_end_notification,
     next_check_interval,
     parse_analysis,
@@ -60,7 +62,29 @@ class CoachingStateTests(unittest.TestCase):
 
         self.assertTrue(decision.allowed)
 
-    def test_reminder_limit_blocks_after_standard_limit(self):
+    def test_distracted_state_can_interrupt_even_when_ai_flag_is_false(self):
+        session = CoachingSession(
+            goal="看学习视频",
+            goal_type="学习/看文档",
+            duration_minutes=15,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
+        )
+        session.last_state = CoachingState.DISTRACTED
+        session.state_started_at = session.started_at + timedelta(minutes=1)
+
+        decision = should_interrupt(
+            session,
+            state=CoachingState.DISTRACTED,
+            confidence=0.9,
+            now=session.started_at + timedelta(minutes=1),
+            ai_should_interrupt=False,
+            message="这个页面和『看学习视频』不太相关。要不要先切回学习视频？",
+        )
+
+        self.assertTrue(decision.allowed)
+
+    def test_reminder_limit_still_blocks_milestone_after_standard_limit(self):
         session = CoachingSession(
             goal="修完启动报错",
             goal_type="写代码/修 bug",
@@ -69,20 +93,64 @@ class CoachingStateTests(unittest.TestCase):
             started_at=datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
         )
         session.reminder_count = 4
-        session.last_state = CoachingState.STUCK
+        session.last_state = CoachingState.MILESTONE
         session.state_started_at = session.started_at
 
         decision = should_interrupt(
             session,
-            state=CoachingState.STUCK,
+            state=CoachingState.MILESTONE,
             confidence=0.9,
             now=session.started_at + timedelta(minutes=20),
             ai_should_interrupt=True,
-            message="这个报错页停了 10 分钟，和目标相关但像是卡住了。要不要我帮你看错误栈？",
+            message="这个目标已经完成了一个节点。下一步可以先运行测试，确认修复没有回退。",
         )
 
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason, "提醒次数已达上限")
+
+    def test_repeated_distracted_reminders_are_not_blocked_by_old_session_limit(self):
+        session = CoachingSession(
+            goal="看学习视频",
+            goal_type="学习/看文档",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
+        )
+        session.reminder_count = 9
+        session.last_state = CoachingState.DISTRACTED
+        session.state_started_at = session.started_at
+
+        decision = should_interrupt(
+            session,
+            state=CoachingState.DISTRACTED,
+            confidence=0.88,
+            now=session.started_at + timedelta(minutes=12),
+            ai_should_interrupt=True,
+            message="这个页面和『看学习视频』不太相关。要不要先切回学习视频？",
+        )
+
+        self.assertTrue(decision.allowed)
+
+    def test_fallback_intervention_message_turns_distracted_observation_into_action(self):
+        session = CoachingSession(
+            goal="看学习视频",
+            goal_type="学习/看文档",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
+        )
+
+        message = fallback_intervention_message(
+            session,
+            CoachingState.DISTRACTED,
+            screen_summary="浏览器打开了社交页面",
+            target_relevance="和看学习视频不相关",
+            suggested_action="切回课程页面",
+        )
+
+        self.assertIn("看学习视频", message)
+        self.assertIn("不相关", message)
+        self.assertIn("切回课程页面", message)
 
     def test_low_confidence_is_unclear_and_silent(self):
         session = CoachingSession(
@@ -161,6 +229,88 @@ class CoachingStateTests(unittest.TestCase):
 
     def test_unclear_keeps_current_interval(self):
         self.assertEqual(next_check_interval(240, CoachingState.UNCLEAR, CoachingIntensity.STANDARD), 240)
+
+    def test_screen_still_tracks_idle_seconds_from_last_change(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="看学习视频",
+            goal_type="学习/看文档",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+        session.record_screen_change(started + timedelta(minutes=2))
+
+        session.record_screen_still(started + timedelta(minutes=5))
+
+        self.assertEqual(session.last_state, CoachingState.IDLE)
+        self.assertEqual(session.still_seconds, 180)
+        self.assertFalse(session.idle_reminder_due(started + timedelta(minutes=5)))
+
+    def test_standard_idle_reminder_is_due_after_five_minutes_and_repeats_later(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="看学习视频",
+            goal_type="学习/看文档",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+        session.record_screen_still(started + timedelta(minutes=5))
+
+        self.assertTrue(session.idle_reminder_due(started + timedelta(minutes=5)))
+        session.record_idle_reminder(started + timedelta(minutes=5))
+        self.assertFalse(session.idle_reminder_due(started + timedelta(minutes=6)))
+        self.assertTrue(session.idle_reminder_due(started + timedelta(minutes=8)))
+
+    def test_screen_change_clears_idle_tracking(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="看学习视频",
+            goal_type="学习/看文档",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+        session.record_screen_still(started + timedelta(minutes=6))
+
+        session.record_screen_change(started + timedelta(minutes=7))
+
+        self.assertEqual(session.still_seconds, 0)
+        self.assertIsNone(session.still_started_at)
+        self.assertEqual(session.last_screen_changed_at, started + timedelta(minutes=7))
+
+    def test_multiple_idle_stretches_are_accumulated_for_session_summary(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="看学习视频",
+            goal_type="学习/看文档",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+        session.record_screen_still(started + timedelta(minutes=5))
+        session.record_screen_change(started + timedelta(minutes=6))
+        session.record_screen_still(started + timedelta(minutes=8))
+
+        self.assertEqual(session.total_idle_seconds, 420)
+
+    def test_idle_reminder_message_mentions_goal_and_idle_minutes(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="看学习视频",
+            goal_type="学习/看文档",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+        session.record_screen_still(started + timedelta(minutes=6))
+
+        message = idle_reminder_message(session)
+
+        self.assertIn("看学习视频", message)
+        self.assertIn("6 分钟", message)
+        self.assertIn("还在", message)
 
     def test_pause_extends_end_time_and_is_limited_to_two_minutes(self):
         started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
@@ -252,6 +402,29 @@ class CoachingStateTests(unittest.TestCase):
         self.assertIn("暂停 1 次", summary.text)
         self.assertIn("没关系", summary.text)
         self.assertNotIn("上下文掉线", summary.text)
+
+    def test_focus_summary_includes_idle_time(self):
+        started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        session = CoachingSession(
+            goal="看学习视频",
+            goal_type="学习/看文档",
+            duration_minutes=45,
+            intensity=CoachingIntensity.STANDARD,
+            started_at=started,
+        )
+        session.record_screen_still(started + timedelta(minutes=5))
+
+        summary = build_focus_summary(
+            session,
+            now=started + timedelta(minutes=45),
+            reason="auto_end",
+            message_index=0,
+        )
+
+        self.assertEqual(summary.idle_seconds, 300)
+        self.assertEqual(summary.focused_seconds, 2400)
+        self.assertIn("本轮专注了 40 分钟", summary.text)
+        self.assertIn("待机 5 分钟", summary.text)
 
     def test_focus_summary_uses_completion_praise_library(self):
         started = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)

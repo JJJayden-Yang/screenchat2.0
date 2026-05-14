@@ -2,10 +2,8 @@
 
 import base64
 import io
-import json
 import os
 import queue
-import re
 import signal
 import sys
 import threading
@@ -21,12 +19,26 @@ from PIL import Image
 import mss
 
 from screenchat.coaching import (
+    CoachingState,
     CoachingSession,
     build_focus_summary,
     build_prompt as build_coaching_prompt,
+    fallback_intervention_message,
+    idle_reminder_message,
+    IDLE_CHECK_INTERVAL_SECONDS,
     parse_analysis as parse_coaching_analysis,
     should_interrupt as should_coaching_interrupt,
+    valid_action_message,
 )
+
+
+def bounded_sleep_interval(session: CoachingSession, requested_seconds: int, now: datetime | None = None) -> int:
+    """睡眠时间不能超过本轮专注剩余时间。"""
+    now = now or datetime.now(timezone.utc)
+    remaining = session.remaining_seconds(now)
+    if remaining <= 0:
+        return 0
+    return max(1, min(int(requested_seconds), remaining))
 
 
 # ── 配置 ──────────────────────────────────────────────────
@@ -37,38 +49,16 @@ def load_config():
     return cfg_load()
 
 
-def _extract_json(raw):
-    """从 AI 返回的文本里尝试抠出 JSON。AI 有时会加 markdown 代码块或废话。"""
-    if not raw:
-        return None
-    # 尝试 1：```json ... ``` 代码块
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1).strip())
-        except json.JSONDecodeError:
-            pass
-    # 尝试 2：从第一个 { 到最后一个 }
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end > start:
-        try:
-            return json.loads(raw[start:end + 1])
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
 # ── 主类 ──────────────────────────────────────────────────
 
 class ScreenChat:
     """
     桌面 AI 陪伴助手的核心。
 
-    三个步骤构成一个循环周期：
+    活动陪跑中，三个步骤构成一个循环周期：
     ① capture()  — 截一张图，缩至 1280px，JPEG 压缩，base64 编码
-    ② analyze()  — 发给 Kimi K2.5，让 AI 看画面决定是否说话
-    ③ 打印结果   — should_comment=true 就打印评论，false 就打个点
+    ② analyze_coaching()  — 发给模型判断目标推进状态
+    ③ 打印/通知   — 只有通过提醒判定才弹出气泡
     """
 
     def __init__(
@@ -152,74 +142,6 @@ class ScreenChat:
 
     # ── 步骤 ②：AI 分析 ───────────────────────────────
 
-    def analyze(self, image_b64):
-        """
-        把 base64 图片发给 Kimi K2.5，带上消息历史。
-
-        返回值是纯 JSON 字符串：
-        {"should_comment": bool, "comment": "...", "category": "..."}
-        """
-        prompt = (
-            "你是「小幕」，一个桌面 AI 陪伴伙伴。\n"
-            "你的个性：像大学室友，会吐槽、会夸你、会提醒你别上头。\n"
-            "不假装是专家，不端着，不假装一直在盯着看。\n"
-            "说话自然口语化，像微信聊天不是工作报告。\n\n"
-            "规则：\n"
-            "- 大部分时候闭嘴。只有真的注意到有趣/有用/不对劲的事才说话。\n"
-            "- 如果画面很日常（桌面、浏览器首页、文件管理器）→ 不用说话。\n"
-            "- 如果用户正在专注做事（打游戏团战、写代码中）→ 尽量不打扰。\n"
-            "- 别说和之前重复的话。\n"
-            "- 只说 1-2 句，简洁自然。\n\n"
-            "只回复 JSON，不要有任何额外内容：\n"
-            '{"should_comment": true或false, "comment": "如果说话，1-2句自然口语。如果不说，空字符串", '
-            '"category": "gaming|coding|trading|studying|writing|social|shopping|language|interview|design|health|general", '
-            '"screen_summary": "可选，20字内概括当前截图内容，方便后续记忆"}'
-        )
-
-        # 构建消息序列：system + 历史文本 + 当前图片
-        messages = [{"role": "system", "content": prompt}]
-        messages.extend(list(self.message_history))
-        messages.append({
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{image_b64}",
-                        "detail": "high",
-                    },
-                }
-            ],
-        })
-
-        for attempt in range(3):
-            try:
-                resp = self.client.chat.completions.create(
-                    model=self.config["model"],
-                    messages=messages,
-                    temperature=1,
-                    max_tokens=2000,
-                )
-                msg = resp.choices[0].message
-                reasoning = getattr(msg, "reasoning_content", "") or ""
-                if reasoning:
-                    print(f"  [debug] {reasoning[:300]}...")
-                raw = (msg.content or "").strip()
-                if raw:
-                    return raw
-                return '{"should_comment": false, "comment": "", "category": "general"}'
-
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "overloaded" in err:
-                    wait = 2 ** attempt
-                    print(f"  (服务繁忙，{wait}s 后重试...)")
-                    time.sleep(wait)
-                    continue
-                raise
-
-        return '{"should_comment": false, "comment": "", "category": "general"}'
-
     def analyze_coaching(self, image_b64, session):
         """陪跑模式：围绕目标输出结构化状态判断。"""
         prompt = build_coaching_prompt(session)
@@ -279,6 +201,62 @@ class ScreenChat:
             status["paused"] = session.is_paused(now)
             status["paused_until"] = session.paused_until.isoformat() if session.paused_until else ""
             status["pause_count"] = session.pause_count
+
+    def _queue_comment(self, message: str, *, force: bool = False):
+        if self.comment_queue is not None and message:
+            if force:
+                self.comment_queue.put({"message": message, "force": True})
+            else:
+                self.comment_queue.put(message)
+
+    def _coaching_intervention_message(self, session, analysis) -> str:
+        if valid_action_message(analysis.message):
+            return analysis.message
+        return fallback_intervention_message(
+            session,
+            analysis.state,
+            analysis.screen_summary,
+            analysis.target_relevance,
+            analysis.suggested_action,
+        )
+
+    def _record_idle_event(self, session, now):
+        idle_minutes = max(1, session.still_seconds // 60)
+        summary = f"屏幕连续 {idle_minutes} 分钟未变化"
+        try:
+            from screenchat.memory import database as memdb
+            memdb.insert_coaching_event(
+                "idle",
+                f"{summary}，可能离开了电脑或在看手机。",
+                screen_summary=summary,
+                coaching_state=CoachingState.IDLE.value,
+                target_goal=session.goal,
+                goal_type=session.goal_type,
+                intensity=session.intensity.value,
+                idle_seconds=session.total_idle_seconds,
+            )
+        except Exception:
+            pass
+
+    def _record_idle_reminder(self, session, now):
+        message = idle_reminder_message(session)
+        session.record_idle_reminder(now)
+        self._record_coaching_reminder(session, message)
+        self._queue_comment(message)
+        try:
+            from screenchat.memory import database as memdb
+            memdb.insert_coaching_event(
+                "reminder",
+                message,
+                screen_summary=f"屏幕连续 {max(1, session.still_seconds // 60)} 分钟未变化",
+                coaching_state=CoachingState.IDLE.value,
+                target_goal=session.goal,
+                goal_type=session.goal_type,
+                intensity=session.intensity.value,
+                idle_seconds=session.total_idle_seconds,
+            )
+        except Exception:
+            pass
 
     # ── Layer 2：场景摘要压缩 ─────────────────────────
 
@@ -346,13 +324,14 @@ class ScreenChat:
                     if self.finish_coaching:
                         self.finish_coaching("auto_end")
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] 💬 陪跑结束")
-                    time.sleep(self.config["capture_interval"])
+                    time.sleep(1)
                     continue
                 sleep_interval = session.check_interval_seconds
                 if session.is_paused(now):
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] · (paused)")
                     self._update_coaching_status_locked(session, now)
-                    time.sleep(min(10, max(1, int((session.paused_until - now).total_seconds()))))
+                    pause_sleep = min(10, max(1, int((session.paused_until - now).total_seconds())))
+                    time.sleep(bounded_sleep_interval(session, pause_sleep, now))
                     continue
 
                 # ① 截图
@@ -361,20 +340,26 @@ class ScreenChat:
                 # ② Layer 3: 感知哈希去重
                 dhash = imagehash.dhash(img)
                 if self._last_dhash is not None and (self._last_dhash - dhash) < 5:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] · (dup)")
-                    session.advance_check_interval(session.last_state)
-                    sleep_interval = session.check_interval_seconds
-                    self._update_coaching_status_locked(session)
+                    now = datetime.now(timezone.utc)
+                    session.record_screen_still(now)
+                    idle_minutes = max(1, session.still_seconds // 60)
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] · (idle: 屏幕未变化 {idle_minutes} 分钟)")
+                    self._record_idle_event(session, now)
+                    if session.idle_reminder_due(now):
+                        self._record_idle_reminder(session, now)
+                    sleep_interval = IDLE_CHECK_INTERVAL_SECONDS
+                    self._update_coaching_status_locked(session, now)
                     if self.running:
-                        time.sleep(sleep_interval)
+                        time.sleep(bounded_sleep_interval(session, sleep_interval))
                     continue
                 self._last_dhash = dhash
+                session.record_screen_change(datetime.now(timezone.utc))
 
                 # ③ 静音检查
                 if self.shared.value:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] · (muted)")
                     if self.running:
-                        time.sleep(sleep_interval)
+                        time.sleep(bounded_sleep_interval(session, sleep_interval))
                     continue
 
                 # ④ 陪跑 AI 分析
@@ -404,11 +389,11 @@ class ScreenChat:
                     analysis.confidence,
                     now,
                     analysis.should_interrupt,
-                    analysis.message,
+                    self._coaching_intervention_message(session, analysis),
                 )
                 ts = datetime.now().strftime("%H:%M:%S")
                 if decision.allowed:
-                    comment = analysis.message
+                    comment = self._coaching_intervention_message(session, analysis)
                     print(f"[{ts}] 💬 {comment}")
                     user_ctx = f"陪跑观察：{analysis.screen_summary}" if analysis.screen_summary else "陪跑观察"
                     self.message_history.append({"role": "user", "content": user_ctx})
@@ -429,31 +414,23 @@ class ScreenChat:
                         )
                     except Exception:
                         pass
-                    if self.comment_queue is not None:
-                        self.comment_queue.put(comment)
+                    self._queue_comment(comment)
                     self._compress_history()
                 else:
                     print(f"[{ts}] · ({decision.state.value}: {decision.reason})")
                 session.advance_check_interval(decision.state)
                 sleep_interval = session.check_interval_seconds
 
-            except json.JSONDecodeError:
-                # AI 有时不听话——试试从文本里抠 JSON
-                result = _extract_json(raw)
-                if result:
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    if result.get("should_comment"):
-                        print(f"[{ts}] 💬 {result['comment']}")
-                    else:
-                        print(f"[{ts}] ·")
-                else:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ JSON 解析失败，原始返回: {raw[:200]}")
             except Exception as e:
                 # 截图失败、网络问题等都兜住，不让循环崩
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ {e}")
 
             if self.running:
-                time.sleep(sleep_interval)
+                session = self._current_session()
+                if session is None:
+                    time.sleep(sleep_interval)
+                else:
+                    time.sleep(bounded_sleep_interval(session, sleep_interval))
 
 
 # ── 入口 ──────────────────────────────────────────────────
@@ -560,6 +537,7 @@ def main():
                 planned_minutes=summary.planned_minutes,
                 focused_seconds=summary.focused_seconds,
                 pause_count=summary.pause_count,
+                idle_seconds=summary.idle_seconds,
                 ended_early=summary.ended_early,
             )
         except Exception:
@@ -567,7 +545,7 @@ def main():
         message_history.append({"role": "user", "content": f"刚结束陪跑：{session.goal}"})
         message_history.append({"role": "assistant", "content": summary.text})
         if mp_comment is not None:
-            mp_comment.put(summary.message)
+            mp_comment.put({"message": summary.message, "force": True})
         print(f"[小幕] 陪跑结束：{session.goal}")
         return summary.text
 

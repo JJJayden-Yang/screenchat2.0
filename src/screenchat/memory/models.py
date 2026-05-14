@@ -19,4 +19,5 @@ class Conversation:
     planned_minutes: int = 0
     focused_seconds: int = 0
     pause_count: int = 0
+    idle_seconds: int = 0
     ended_early: bool = False

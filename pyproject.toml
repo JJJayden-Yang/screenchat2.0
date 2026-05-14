@@ -1,7 +1,7 @@
 [project]
 name = "screenchat"
 version = "0.1.0"
-description = "Desktop AI companion — watches your screen and chats with you"
+description = "macOS AI focus coach with screen-aware reminders and a 3D focus galaxy"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [

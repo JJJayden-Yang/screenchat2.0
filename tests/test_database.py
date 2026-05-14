@@ -30,6 +30,7 @@ class DatabaseCoachingEventTests(unittest.TestCase):
             planned_minutes=45,
             focused_seconds=1800,
             pause_count=1,
+            idle_seconds=300,
             ended_early=True,
         )
 
@@ -43,6 +44,7 @@ class DatabaseCoachingEventTests(unittest.TestCase):
         self.assertEqual(records[0].planned_minutes, 45)
         self.assertEqual(records[0].focused_seconds, 1800)
         self.assertEqual(records[0].pause_count, 1)
+        self.assertEqual(records[0].idle_seconds, 300)
         self.assertTrue(records[0].ended_early)
 
     def test_get_all_returns_focus_history_for_dashboard(self):

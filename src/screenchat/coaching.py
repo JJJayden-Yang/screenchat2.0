@@ -11,6 +11,7 @@ class CoachingState(str, Enum):
     STUCK = "stuck"
     MILESTONE = "milestone"
     UNCLEAR = "unclear"
+    IDLE = "idle"
 
 
 class CoachingIntensity(str, Enum):
@@ -50,6 +51,14 @@ CHECK_BACKOFF_STEPS = {
     CoachingIntensity.STRICT: (60, 120, 240, 480),
 }
 
+IDLE_CHECK_INTERVAL_SECONDS = 60
+IDLE_REMINDER_AFTER = {
+    CoachingIntensity.LIGHT: timedelta(minutes=8),
+    CoachingIntensity.STANDARD: timedelta(minutes=5),
+    CoachingIntensity.STRICT: timedelta(minutes=3),
+}
+IDLE_REMINDER_REPEAT_AFTER = timedelta(minutes=3)
+
 
 @dataclass
 class CoachingSession:
@@ -67,6 +76,11 @@ class CoachingSession:
     state_started_at: datetime | None = None
     last_reminders: list[str] = field(default_factory=list)
     state_log: list[tuple[datetime, CoachingState, str]] = field(default_factory=list)
+    last_screen_changed_at: datetime | None = None
+    still_started_at: datetime | None = None
+    still_seconds: int = 0
+    total_idle_seconds: int = 0
+    last_idle_reminder_at: datetime | None = None
 
     def __post_init__(self):
         if isinstance(self.intensity, str):
@@ -74,6 +88,8 @@ class CoachingSession:
         self.check_interval_seconds = CHECK_BACKOFF_STEPS[self.intensity][0]
         if self.state_started_at is None:
             self.state_started_at = self.started_at
+        if self.last_screen_changed_at is None:
+            self.last_screen_changed_at = self.started_at
 
     @property
     def ends_at(self) -> datetime:
@@ -117,6 +133,37 @@ class CoachingSession:
             self.last_state = state
             self.state_started_at = now
         self.state_log.append((now, state, summary))
+
+    def record_screen_change(self, now: datetime):
+        self.last_screen_changed_at = now
+        self.still_started_at = None
+        self.still_seconds = 0
+
+    def record_screen_still(self, now: datetime):
+        if self.still_started_at is None:
+            self.still_started_at = self.last_screen_changed_at or now
+        previous_still_seconds = self.still_seconds
+        self.still_seconds = max(
+            IDLE_CHECK_INTERVAL_SECONDS,
+            int((now - self.still_started_at).total_seconds()),
+        )
+        self.total_idle_seconds += max(0, self.still_seconds - previous_still_seconds)
+        self.update_state(
+            CoachingState.IDLE,
+            now,
+            f"屏幕连续 {max(1, self.still_seconds // 60)} 分钟未变化",
+        )
+
+    def idle_reminder_due(self, now: datetime) -> bool:
+        threshold = IDLE_REMINDER_AFTER[self.intensity]
+        if self.still_seconds < int(threshold.total_seconds()):
+            return False
+        if self.last_idle_reminder_at is None:
+            return True
+        return now - self.last_idle_reminder_at >= IDLE_REMINDER_REPEAT_AFTER
+
+    def record_idle_reminder(self, now: datetime):
+        self.last_idle_reminder_at = now
 
     def record_reminder(self, message: str):
         self.reminder_count += 1
@@ -165,6 +212,7 @@ class FocusSummary:
     focused_seconds: int
     pause_count: int
     paused_seconds: int
+    idle_seconds: int
     ended_early: bool
     message: str
     text: str
@@ -214,7 +262,7 @@ def next_check_interval(
     state = parse_state(state)
     intensity = parse_intensity(intensity)
     steps = CHECK_BACKOFF_STEPS[intensity]
-    if state in (CoachingState.DISTRACTED, CoachingState.STUCK):
+    if state in (CoachingState.DISTRACTED, CoachingState.STUCK, CoachingState.IDLE):
         return steps[0]
     if state == CoachingState.UNCLEAR:
         return current_seconds
@@ -236,6 +284,12 @@ def manual_end_notification(session: CoachingSession, now: datetime | None = Non
     if now < session.ends_at:
         return f"这轮「{session.goal}」先到这里也没关系，已经比完全没开始强很多。歇一下，下一轮再接着来。"
     return "陪跑结束，已生成本轮总结。"
+
+
+def idle_reminder_message(session: CoachingSession) -> str:
+    """屏幕长期不变时，提醒用户确认自己是否还在专注。"""
+    idle_minutes = max(1, session.still_seconds // 60)
+    return f"屏幕已经 {idle_minutes} 分钟没变化了。你还在「{session.goal}」上吗？如果只是走神或去看手机了，先把注意力拉回来。"
 
 
 def _pick_message(messages: tuple[str, ...], session: CoachingSession, message_index: int | None) -> str:
@@ -271,8 +325,9 @@ def build_focus_summary(
     now = now or datetime.now(timezone.utc)
     ended_early = reason != "auto_end" and now < session.ends_at
     paused_seconds = _used_pause_seconds(session, now)
+    idle_seconds = max(0, int(session.total_idle_seconds or 0))
     elapsed_seconds = max(0, int((now - session.started_at).total_seconds()))
-    focused_seconds = max(0, elapsed_seconds - paused_seconds)
+    focused_seconds = max(0, elapsed_seconds - paused_seconds - idle_seconds)
     planned_seconds = session.duration_minutes * 60
     focused_seconds = min(focused_seconds, planned_seconds)
     messages = EARLY_END_MESSAGES if ended_early else COMPLETION_MESSAGES
@@ -283,6 +338,7 @@ def build_focus_summary(
         f"{status}：{session.goal}\n"
         f"本轮专注了 {_format_duration(focused_seconds)}，计划 {session.duration_minutes} 分钟。\n"
         f"暂停 {session.pause_count} 次，共 {_format_duration(paused_seconds)}。\n"
+        f"待机 {_format_duration(idle_seconds)}。\n"
         f"{message}"
     )
     return FocusSummary(
@@ -293,6 +349,7 @@ def build_focus_summary(
         focused_seconds=focused_seconds,
         pause_count=session.pause_count,
         paused_seconds=paused_seconds,
+        idle_seconds=idle_seconds,
         ended_early=ended_early,
         message=message,
         text=text,
@@ -365,6 +422,24 @@ def valid_action_message(message: str) -> bool:
     return has_goal_relation and has_action
 
 
+def fallback_intervention_message(
+    session: CoachingSession,
+    state: CoachingState,
+    screen_summary: str = "",
+    target_relevance: str = "",
+    suggested_action: str = "",
+) -> str:
+    """把结构化观察补成可弹出的行动提醒。"""
+    state = parse_state(state)
+    relation = target_relevance or screen_summary or "当前屏幕看起来和目标不太贴合"
+    action = suggested_action or f"先切回「{session.goal}」相关页面"
+    if state == CoachingState.STUCK:
+        return f"我看到你像是在「{session.goal}」上卡住了：{relation}。要不要{action}？"
+    if state == CoachingState.MILESTONE:
+        return f"「{session.goal}」像是完成了一个节点：{relation}。下一步可以{action}。"
+    return f"我看到你偏离了「{session.goal}」：{relation}。要不要{action}？"
+
+
 def should_interrupt(
     session: CoachingSession,
     state: CoachingState,
@@ -378,13 +453,13 @@ def should_interrupt(
         return InterruptDecision(False, "置信度过低", CoachingState.UNCLEAR)
     if state in (CoachingState.ON_TRACK, CoachingState.UNCLEAR):
         return InterruptDecision(False, "当前无需介入", state)
-    if not ai_should_interrupt and state != CoachingState.MILESTONE:
+    if not ai_should_interrupt and state not in (CoachingState.DISTRACTED, CoachingState.STUCK, CoachingState.MILESTONE):
         return InterruptDecision(False, "AI 未建议介入", state)
     if not valid_action_message(message):
         return InterruptDecision(False, "提醒缺少行动价值", state)
 
     rule = INTENSITY_RULES[session.intensity]
-    if session.reminder_count >= rule.max_reminders:
+    if state == CoachingState.MILESTONE and session.reminder_count >= rule.max_reminders:
         return InterruptDecision(False, "提醒次数已达上限", state)
     if session.reminder_count == 0 and state in (CoachingState.DISTRACTED, CoachingState.STUCK):
         return InterruptDecision(True, "首次明确偏离或卡住，允许提醒", state)
@@ -422,6 +497,7 @@ def build_prompt(session: CoachingSession) -> str:
         "- stuck：屏幕与目标相关，但像是在同一问题上卡住。\n"
         "- milestone：完成一个节点，适合建议下一步。\n"
         "- unclear：看不懂或不确定，必须沉默。\n\n"
+        "系统可能把屏幕长期不变记录为 idle；这是系统侧判断，你不要主动返回 idle。\n\n"
         "主动消息必须同时包含：观察、和目标的关系、下一步动作。纯吐槽或泛泛鼓励必须留空。\n"
         "只回复 JSON，不要有额外内容：\n"
         '{"state":"on_track|distracted|stuck|milestone|unclear",'
